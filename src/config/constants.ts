@@ -3,12 +3,15 @@ export const DEFAULT_INCLUDE = [
   "**/*.{py,pyi}",
   "**/*.{go,rs,java,kt,scala}",
   "**/*.{c,cpp,cc,h,hpp}",
-  "**/*.{rb,php,swift}",
+  "**/*.{rb,php,inc,swift}",
+  "**/*.{cls,trigger}",
   "**/*.{vue,svelte,astro}",
   "**/*.{sql,graphql,proto}",
   "**/*.{yaml,yml,toml}",
   "**/*.{md,mdx}",
   "**/*.{sh,bash,zsh}",
+  "**/*.{txt,html,htm}",
+  "**/*.zig",
 ];
 
 export const DEFAULT_EXCLUDE = [
@@ -16,6 +19,7 @@ export const DEFAULT_EXCLUDE = [
   "**/.git/**",
   "**/dist/**",
   "**/build/**",
+  "**/*build*/**",
   "**/*.min.js",
   "**/*.bundle.js",
   "**/vendor/**",
@@ -25,8 +29,9 @@ export const DEFAULT_EXCLUDE = [
   "**/.next/**",
   "**/.nuxt/**",
   "**/.opencode/**",
+  "**/.*",
+  "**/.*/**",
 ];
-
 
 export const EMBEDDING_MODELS = {
   "google": {
@@ -73,7 +78,7 @@ export const EMBEDDING_MODELS = {
       provider: "ollama",
       model: "nomic-embed-text",
       dimensions: 768,
-      maxTokens: 8192,
+      maxTokens: 2048,
       costPer1MTokens: 0.00,
     },
     "mxbai-embed-large": {
@@ -98,6 +103,13 @@ export const EMBEDDING_MODELS = {
 export const DEFAULT_PROVIDER_MODELS = {
   "github-copilot": "text-embedding-3-small",
   "openai": "text-embedding-3-small",
-  "google": "text-embedding-005",
+  "google": "gemini-embedding-001",
   "ollama": "nomic-embed-text",
-} as const
+} as const;
+
+export const AUTO_DETECT_PROVIDER_ORDER = [
+  "ollama",
+  "github-copilot",
+  "openai",
+  "google",
+] as const;

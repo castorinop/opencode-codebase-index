@@ -30,7 +30,11 @@ pub enum Language {
     Yaml,
     Bash,
     Markdown,
-    Unknown,
+    Html,
+    Php,
+    Apex,
+    Zig,
+    Text,
 }
 
 impl Language {
@@ -53,7 +57,12 @@ impl Language {
             "yaml" | "yml" => Language::Yaml,
             "sh" | "bash" | "zsh" => Language::Bash,
             "md" | "mdx" => Language::Markdown,
-            _ => Language::Unknown,
+            "html" | "htm" => Language::Html,
+            "txt" => Language::Text,
+            "php" | "inc" => Language::Php,
+            "zig" => Language::Zig,
+            "cls" | "trigger" => Language::Apex,
+            _ => Language::Text,
         }
     }
 
@@ -76,7 +85,11 @@ impl Language {
             Language::Yaml => "yaml",
             Language::Bash => "bash",
             Language::Markdown => "markdown",
-            Language::Unknown => "unknown",
+            Language::Html => "html",
+            Language::Php => "php",
+            Language::Zig => "zig",
+            Language::Apex => "apex",
+            Language::Text => "text",
         }
     }
 
@@ -99,7 +112,12 @@ impl Language {
             "yaml" | "yml" => Language::Yaml,
             "bash" | "sh" | "zsh" => Language::Bash,
             "markdown" | "md" => Language::Markdown,
-            _ => Language::Unknown,
+            "html" | "htm" => Language::Html,
+            "text" | "txt" => Language::Text,
+            "php" => Language::Php,
+            "zig" => Language::Zig,
+            "apex" => Language::Apex,
+            _ => Language::Text,
         }
     }
 }

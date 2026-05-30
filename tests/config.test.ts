@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { substituteEnvReferences } from "../src/config/env-substitution.js";
 import {
   parseConfig,
   getDefaultModelForProvider,
@@ -6,10 +7,75 @@ import {
 } from "../src/config/schema.js";
 import {
   EMBEDDING_MODELS,
+  AUTO_DETECT_PROVIDER_ORDER,
   DEFAULT_PROVIDER_MODELS,
 } from "../src/config/constants.js";
 
 describe("config schema", () => {
+  describe("substituteEnvReferences", () => {
+    it("should replace an env placeholder string with the environment value", () => {
+      vi.stubEnv("OPENCODE_TEST_API_KEY", "secret-key");
+
+      expect(substituteEnvReferences("{env:OPENCODE_TEST_API_KEY}")).toBe("secret-key");
+
+      vi.unstubAllEnvs();
+    });
+
+    it("should replace nested env placeholders in objects and arrays", () => {
+      vi.stubEnv("OPENCODE_TEST_BASE_URL", "https://example.test/v1");
+      vi.stubEnv("OPENCODE_TEST_API_KEY", "secret-key");
+
+      const substituted = substituteEnvReferences({
+        customProvider: {
+          baseUrl: "{env:OPENCODE_TEST_BASE_URL}",
+          apiKey: "{env:OPENCODE_TEST_API_KEY}",
+        },
+        include: ["src/**/*.ts", "{env:OPENCODE_TEST_API_KEY}"],
+      });
+
+      expect(substituted).toEqual({
+        customProvider: {
+          baseUrl: "https://example.test/v1",
+          apiKey: "secret-key",
+        },
+        include: ["src/**/*.ts", "secret-key"],
+      });
+
+      vi.unstubAllEnvs();
+    });
+
+    it("should leave non-placeholder strings unchanged", () => {
+      expect(substituteEnvReferences("custom-provider")).toBe("custom-provider");
+    });
+
+    it("should reject malformed env reference strings", () => {
+      expect(() => substituteEnvReferences("prefix-{env:OPENCODE_TEST_API_KEY}")).toThrow(
+        "Invalid environment variable reference"
+      );
+      expect(() => substituteEnvReferences("{env:opencode_test_api_key}")).toThrow(
+        "Invalid environment variable reference"
+      );
+    });
+
+    it("should throw when a referenced environment variable is missing", () => {
+      expect(() => substituteEnvReferences({
+        customProvider: {
+          apiKey: "{env:OPENCODE_MISSING_API_KEY}",
+        },
+      })).toThrow("Missing environment variable 'OPENCODE_MISSING_API_KEY' referenced by config at '$root.customProvider.apiKey'.");
+    });
+
+    it("should preserve non-string values", () => {
+      expect(substituteEnvReferences({
+        indexing: { autoIndex: true, maxChunksPerFile: 5 },
+        search: { hybridWeight: 0.5 },
+      })).toEqual({
+        indexing: { autoIndex: true, maxChunksPerFile: 5 },
+        search: { hybridWeight: 0.5 },
+      });
+    });
+  });
+
   describe("parseConfig", () => {
     it("should return defaults for undefined input", () => {
       const config = parseConfig(undefined);
@@ -17,8 +83,8 @@ describe("config schema", () => {
       expect(config.embeddingProvider).toBe("auto");
       expect(config.embeddingModel).toBeUndefined();
       expect(config.scope).toBe("project");
-      expect(config.include).toHaveLength(10);
-      expect(config.exclude).toHaveLength(13);
+      expect(config.include).toHaveLength(13);
+      expect(config.exclude).toHaveLength(16);
     });
 
     it("should return defaults for null input", () => {
@@ -111,13 +177,13 @@ describe("config schema", () => {
     });
 
     it("should fallback to defaults for non-array include", () => {
-      expect(parseConfig({ include: "string" }).include).toHaveLength(10);
-      expect(parseConfig({ include: 123 }).include).toHaveLength(10);
+      expect(parseConfig({ include: "string" }).include).toHaveLength(13);
+      expect(parseConfig({ include: 123 }).include).toHaveLength(13);
     });
 
     it("should fallback to defaults for include with non-string items", () => {
-      expect(parseConfig({ include: [123, 456] }).include).toHaveLength(10);
-      expect(parseConfig({ include: ["valid", 123] }).include).toHaveLength(10);
+      expect(parseConfig({ include: [123, 456] }).include).toHaveLength(13);
+      expect(parseConfig({ include: ["valid", 123] }).include).toHaveLength(13);
     });
 
     it("should parse exclude as string array", () => {
@@ -202,6 +268,9 @@ describe("config schema", () => {
             minScore: 0.2,
             includeContext: false,
             hybridWeight: 0.7,
+            fusionStrategy: "weighted",
+            rrfK: 80,
+            rerankTopN: 12,
             contextLines: 10,
           },
         });
@@ -210,7 +279,42 @@ describe("config schema", () => {
         expect(config.search.minScore).toBe(0.2);
         expect(config.search.includeContext).toBe(false);
         expect(config.search.hybridWeight).toBe(0.7);
+        expect(config.search.fusionStrategy).toBe("weighted");
+        expect(config.search.rrfK).toBe(80);
+        expect(config.search.rerankTopN).toBe(12);
         expect(config.search.contextLines).toBe(10);
+      });
+
+      it("should use default search ranking config values", () => {
+        const config = parseConfig({});
+        expect(config.search.fusionStrategy).toBe("rrf");
+        expect(config.search.rrfK).toBe(60);
+        expect(config.search.rerankTopN).toBe(20);
+        expect(config.search.routingHints).toBe(true);
+      });
+
+      it("should parse routingHints boolean", () => {
+        expect(parseConfig({ search: { routingHints: false } }).search.routingHints).toBe(false);
+        expect(parseConfig({ search: { routingHints: true } }).search.routingHints).toBe(true);
+      });
+
+      it("should fallback routingHints to default for invalid values", () => {
+        expect(parseConfig({ search: { routingHints: "nope" } }).search.routingHints).toBe(true);
+      });
+
+      it("should fallback fusionStrategy to default for invalid values", () => {
+        const config = parseConfig({ search: { fusionStrategy: "invalid" } });
+        expect(config.search.fusionStrategy).toBe("rrf");
+      });
+
+      it("should clamp rrfK and rerankTopN bounds", () => {
+        expect(parseConfig({ search: { rrfK: 0 } }).search.rrfK).toBe(1);
+        expect(parseConfig({ search: { rrfK: -10 } }).search.rrfK).toBe(1);
+        expect(parseConfig({ search: { rrfK: 25.7 } }).search.rrfK).toBe(25);
+
+        expect(parseConfig({ search: { rerankTopN: -1 } }).search.rerankTopN).toBe(0);
+        expect(parseConfig({ search: { rerankTopN: 999 } }).search.rerankTopN).toBe(200);
+        expect(parseConfig({ search: { rerankTopN: 10.9 } }).search.rerankTopN).toBe(10);
       });
 
       it("should clamp hybridWeight to 0-1 range", () => {
@@ -227,6 +331,75 @@ describe("config schema", () => {
 
       it("should handle non-object search", () => {
         expect(parseConfig({ search: "invalid" }).search.maxResults).toBe(20);
+      });
+
+      it("should parse reranker config when enabled", () => {
+        const config = parseConfig({
+          reranker: {
+            enabled: true,
+            provider: "cohere",
+            model: "rerank-v3.5",
+            apiKey: "test-key",
+            topN: 12,
+            timeoutMs: 4000,
+          },
+        });
+
+        expect(config.reranker).toEqual({
+          enabled: true,
+          provider: "cohere",
+          model: "rerank-v3.5",
+          baseUrl: "https://api.cohere.ai/v1",
+          apiKey: "test-key",
+          topN: 12,
+          timeoutMs: 4000,
+        });
+      });
+
+      it("should require model for enabled reranker", () => {
+        expect(() => parseConfig({
+          reranker: {
+            enabled: true,
+            provider: "cohere",
+            apiKey: "test-key",
+          },
+        })).toThrow("reranker is enabled but reranker.model is missing or invalid.");
+      });
+
+      it("should require apiKey for hosted reranker providers", () => {
+        expect(() => parseConfig({
+          reranker: {
+            enabled: true,
+            provider: "jina",
+            model: "jina-reranker-v2-base-multilingual",
+          },
+        })).toThrow("reranker provider 'jina' requires reranker.apiKey when enabled.");
+      });
+
+      it("should require baseUrl for custom reranker provider", () => {
+        expect(() => parseConfig({
+          reranker: {
+            enabled: true,
+            provider: "custom",
+            model: "custom-reranker",
+          },
+        })).toThrow("reranker is enabled but reranker.baseUrl is missing or invalid for provider 'custom'.");
+      });
+
+      it("should clamp reranker topN and timeoutMs", () => {
+        const config = parseConfig({
+          reranker: {
+            enabled: true,
+            provider: "custom",
+            model: "custom-reranker",
+            baseUrl: "https://rerank.example/v1",
+            topN: 999,
+            timeoutMs: 100,
+          },
+        });
+
+        expect(config.reranker?.topN).toBe(50);
+        expect(config.reranker?.timeoutMs).toBe(1000);
       });
     });
 
@@ -262,6 +435,62 @@ describe("config schema", () => {
         });
         expect(config.customProvider!.apiKey).toBe("sk-test-key");
         expect(config.customProvider!.maxTokens).toBe(4096);
+      });
+
+      it("should accept env-substituted custom provider credentials", () => {
+        vi.stubEnv("OPENCODE_CUSTOM_PROVIDER_URL", "https://api.example.com/v1");
+        vi.stubEnv("OPENCODE_CUSTOM_PROVIDER_KEY", "sk-env-key");
+
+        const config = parseConfig(substituteEnvReferences({
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "{env:OPENCODE_CUSTOM_PROVIDER_URL}",
+            model: "my-model",
+            dimensions: 1024,
+            apiKey: "{env:OPENCODE_CUSTOM_PROVIDER_KEY}",
+          },
+        }));
+
+        expect(config.customProvider!.baseUrl).toBe("https://api.example.com/v1");
+        expect(config.customProvider!.apiKey).toBe("sk-env-key");
+
+        vi.unstubAllEnvs();
+      });
+
+      it("should ignore env refs in inactive customProvider branches", () => {
+        const config = parseConfig({
+          embeddingProvider: "openai",
+          customProvider: {
+            baseUrl: "{env:EMBED_BASE_URL}",
+            model: "{env:EMBED_MODEL}",
+            dimensions: 768,
+            apiKey: "{env:MISSING_API_KEY}",
+          },
+        });
+
+        expect(config.embeddingProvider).toBe("openai");
+        expect(config.customProvider).toBeUndefined();
+      });
+
+      it("should reject malformed env refs in active custom provider fields", () => {
+        expect(() => parseConfig({
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "prefix-{env:EMBED_BASE_URL}",
+            model: "test",
+            dimensions: 768,
+          },
+        })).toThrow("Invalid environment variable reference");
+
+        expect(() => parseConfig({
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "test",
+            dimensions: 768,
+            apiKey: "{env:embed_api_key}",
+          },
+        })).toThrow("Invalid environment variable reference");
       });
 
       it("should throw when custom provider is selected but config is missing", () => {
@@ -474,6 +703,32 @@ describe("config schema", () => {
         expect(config.customProvider!.requestIntervalMs).toBe(0);
       });
 
+      it("should parse custom provider with maxBatchSize", () => {
+        const config = parseConfig({
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "test",
+            dimensions: 768,
+            maxBatchSize: 64,
+          },
+        });
+        expect(config.customProvider!.maxBatchSize).toBe(64);
+      });
+
+      it("should parse custom provider with max_batch_size alias", () => {
+        const config = parseConfig({
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "test",
+            dimensions: 768,
+            max_batch_size: 32,
+          },
+        });
+        expect(config.customProvider!.maxBatchSize).toBe(32);
+      });
+
       it("should clamp concurrency to minimum of 1", () => {
         const config = parseConfig({
           embeddingProvider: "custom",
@@ -485,6 +740,19 @@ describe("config schema", () => {
           },
         });
         expect(config.customProvider!.concurrency).toBe(1);
+      });
+
+      it("should clamp maxBatchSize to minimum of 1", () => {
+        const config = parseConfig({
+          embeddingProvider: "custom",
+          customProvider: {
+            baseUrl: "http://localhost:11434/v1",
+            model: "test",
+            dimensions: 768,
+            maxBatchSize: 0,
+          },
+        });
+        expect(config.customProvider!.maxBatchSize).toBe(1);
       });
 
       it("should leave concurrency undefined when not provided", () => {
@@ -569,8 +837,8 @@ describe("config schema", () => {
     it("should return correct model for google", () => {
       const model = getDefaultModelForProvider("google");
       expect(model.provider).toBe("google");
-      expect(model.model).toBe("text-embedding-005");
-      expect(model.dimensions).toBe(768);
+      expect(model.model).toBe("gemini-embedding-001");
+      expect(model.dimensions).toBe(1536);
     });
 
     it("should return correct model for ollama", () => {
@@ -634,6 +902,11 @@ describe("config schema", () => {
       expect(EMBEDDING_MODELS["ollama"]["mxbai-embed-large"].costPer1MTokens).toBe(0);
     });
 
+    it("should use the observed effective token budget for built-in ollama models", () => {
+      expect(EMBEDDING_MODELS["ollama"]["nomic-embed-text"].maxTokens).toBe(2048);
+      expect(EMBEDDING_MODELS["ollama"]["mxbai-embed-large"].maxTokens).toBe(512);
+    });
+
     it("should have non-zero cost for paid providers", () => {
       expect(EMBEDDING_MODELS["openai"]["text-embedding-3-small"].costPer1MTokens).toBeGreaterThan(0);
       expect(EMBEDDING_MODELS["openai"]["text-embedding-3-large"].costPer1MTokens).toBeGreaterThan(0);
@@ -669,6 +942,16 @@ describe("config schema", () => {
       const providers = Object.keys(EMBEDDING_MODELS);
       const defaultProviders = Object.keys(DEFAULT_PROVIDER_MODELS);
       expect(defaultProviders.sort()).toEqual(providers.sort());
+    });
+
+    it("should prefer Ollama before cloud providers for auto-detection", () => {
+      expect(AUTO_DETECT_PROVIDER_ORDER[0]).toBe("ollama");
+      expect(AUTO_DETECT_PROVIDER_ORDER.indexOf("github-copilot")).toBeGreaterThan(
+        AUTO_DETECT_PROVIDER_ORDER.indexOf("ollama"),
+      );
+      expect(AUTO_DETECT_PROVIDER_ORDER.indexOf("google")).toBeGreaterThan(
+        AUTO_DETECT_PROVIDER_ORDER.indexOf("github-copilot"),
+      );
     });
   });
 });

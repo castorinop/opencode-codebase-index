@@ -5,6 +5,120 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Subsystem module splits**: Split large config, embeddings, eval, MCP, watcher, git, tools, routing, and utility modules into smaller focused files while preserving public entrypoints (#92).
+- **AI slop removal**: Trimmed redundant comments and small wrapper noise across config, eval, runtime, indexer, tools, and utils with behavior-neutral refactors (#93).
+
+- **Remove SiliconFlow default**: The custom reranker no longer falls back to a Chinese endpoint (`api.siliconflow.cn`). A `baseUrl` is now required for the `custom` reranker provider. README examples updated to use Cohere and generic env-var placeholders.
+### Fixed
+- **SSRF protection for custom embedding provider**: Custom provider URLs are now validated against cloud metadata endpoints (169.254.x.x, metadata.google.internal) and non-HTTP protocols to prevent server-side request forgery via malicious config files.
+- **Knowledge base path restrictions**: `add_knowledge_base` now blocks sensitive system directories (`/etc`, `/proc`, `/sys`, `/dev`, `/boot`, `/root`, `/var/run`, `/var/log`) and home dotdirs (`.ssh`, `.gnupg`, `.aws`, `.config/gcloud`, `.docker`, `.kube`). Symlinks are resolved before checking.
+- **Google API key moved to header**: The Google embedding provider now sends the API key via the `x-goog-api-key` header instead of a URL query parameter, preventing credential exposure in logs and proxies.
+- **Error response truncation**: All embedding providers now truncate error response bodies to 500 characters, preventing reflection of potentially sensitive data from misconfigured or malicious endpoints.
+- **Config and eval loading hardening**: File-specific parse/shape errors, knowledge-base/include path rebasing fixes, and malformed eval summary coverage (#92).
+- **Command and indexer diagnostics**: Surface command file read failures and warn-level cache recovery details for corrupted persisted state (#92).
+
+## [0.8.1] - 2026-05-22
+
+### Changed
+- **Release metadata alignment**: Reconciled the post-`v0.8.0` shipped delta so the changelog and release metadata match the fixes that landed after the `v0.8.0` tag.
+
+### Fixed
+- **Atomic file-hash cache writes**: `Indexer.atomicWriteSync()` now recreates missing parent directories before writing `file-hashes.json.tmp`, preventing `ENOENT` crashes after the index directory has been removed.
+
+## [0.8.0] - 2026-05-14
+
+### Added
+- **Git worktree fallback and reuse**: Fresh git worktrees now inherit the main repository's project-scoped `.opencode` config and index when no local worktree state exists, including matching eval-path and knowledge-base handling.
+- **Apex semantic parsing**: Added tree-sitter-based semantic chunking for Salesforce Apex source files (`.cls` and `.trigger`) via the [`tree-sitter-sfapex`](https://github.com/aheber/tree-sitter-sfapex) grammar. Recognizes class, interface, enum, method, constructor, and trigger declarations with leading JavaDoc-style block comments attached to their target chunks. Anonymous Apex (`.apex`), SOQL, and SOSL standalone files are out of scope.
+- **Apex call graph extraction**: Method invocations, constructor calls (`new MyClass(...)`), and instance/static method calls are extracted for the `call_graph` tool. Apex is case-insensitive at the language level, so callee names are normalized to lowercase during extraction (matching the existing PHP behavior). Apex has no imports — namespaces are referenced via fully qualified names — so no `Import` edges are produced.
+- **Zig language support**: Added tree-sitter semantic parsing, file discovery, and call-graph extraction for `.zig` files.
+- **New slash commands**: Added `/peek` for lightweight location-first discovery and `/reindex` as a full rebuild shortcut.
+
+### Changed
+- **Ollama oversized-input handling**: Built-in Ollama embeddings now use pooled multi-part requests, broader context-length detection, and progressive retry/backoff behavior for oversized inputs.
+- **Release documentation and support guidance**: Aligned maintainer guidance, support policy, and release workflow docs with the protected-branch release process used for `v0.8.0`.
+
+### Fixed
+- **Index reset and cleanup hardening**: Fixed shared/global rebuild flows, SQLite corruption recovery, stale chunk ownership cleanup, and related rebuild-state edge cases across project and worktree setups.
+- **Windows build and test reliability**: Fixed Windows-native build/test failures with explicit database/indexer cleanup, portable path handling, and cross-platform native pretest scripting.
+- **Database close lifecycle**: Hardened `Database.close()` so use-after-close fails fast instead of silently swapping to an in-memory SQLite connection.
+- **Semantic search and rebuild cleanup**: Restored identifier fallback in semantic search and rebuilt cleanup paths from SQLite-backed state without relying on unsafe native remove flows.
+
+## [0.7.0] - 2026-04-14
+
+### Added
+- **Knowledge base support**: Added `add_knowledge_base`, `list_knowledge_bases`, and `remove_knowledge_base` tools to manage external document folders indexed alongside the project
+- **Reranking with SiliconFlow**: Added `BAAI/bge-reranker-v2-m3` reranking support via SiliconFlow API for improved search result quality
+- **Routing hints for local discovery**: Added dynamic routing hints so local search can steer retrieval toward more relevant code paths before semantic reranking
+- **TXT/HTML file support**: Added `*.txt`, `*.html`, `*.htm` to default include patterns for document indexing
+- **Config merging**: Global and project configs are now merged, allowing shared provider settings at global level and knowledge base paths at project level
+- **Hidden file exclusion**: Files and folders starting with `.` are now excluded from indexing and file watching
+- **Build folder exclusion**: Folders containing "build" in their name (e.g., `build`, `mingwBuildDebug`) are now excluded from indexing and file watching
+- **additionalInclude config**: Added new config option to extend default file patterns without replacing them
+- **Eval diversity quality gates**: Added raw and distinct top-k diversity metrics, budgets, and regression coverage for eval runs and reranker benchmarking
+
+### Changed
+- **Default verbose=false**: Changed `/index` command default to `verbose=false` to reduce token consumption
+- **Dependency hardening**: Added targeted npm overrides and refreshed lockfile resolution to keep vulnerable transitive packages patched in release builds
+
+### Fixed
+- **Knowledge base refresh behavior**: Adding or removing knowledge bases now rebuilds the shared in-memory indexer immediately instead of requiring a restart
+- **Watcher-triggered reindexing**: Restored automatic reindexing on file changes so watched projects and attached knowledge bases stay current during a live session
+- **Parser and call-graph stability**: Fixed recursion-limit and segmentation-fault regressions, removed unsupported parent traversal paths, and improved PHP method-call extraction reliability
+- **Plugin/runtime packaging**: Kept `@opencode-ai/plugin` available at runtime by shipping it as a dependency instead of relying on dev-only installation
+- **Eval workflow rate limiting**: Throttled GitHub Models quality runs to avoid rate-limit failures in the release verification pipeline
+
+## [0.6.1] - 2026-03-29
+
+### Added
+- **Custom provider batch caps**: Added `customProvider.maxBatchSize` / `max_batch_size` support so OpenAI-compatible embedding servers can cap inputs per `/embeddings` request
+- **Environment placeholders in config**: Added `{env:VAR_NAME}` placeholder support for string config values so secrets and endpoints can be supplied from the environment instead of committed files
+
+### Changed
+- **Release documentation alignment**: Updated release metadata to publish the post-`v0.6.0` config improvements as `v0.6.1`
+
+## [0.6.0] - 2026-03-28
+
+### Added
+- **Evaluation harness**: First-class eval CLI, golden datasets, budgets, compare mode, run artifacts, and smoke/quality workflows for measuring retrieval quality over time
+- **Implementation lookup workflow**: Added a dedicated definition/implementation retrieval path across the CLI, plugin tools, MCP server, indexer, and tests for faster code lookup by intent
+- **Cross-repo benchmarking**: Added a benchmark runner with ripgrep and ast-grep baselines plus reproducible benchmarking documentation and golden datasets for external repos
+- **Release automation guardrails**: Added Release Drafter automation and CI enforcement for release-category and semver labels on pull requests
+- **Contributor language-support guide**: Added an agent-ready guide for extending semantic parsing and call-graph support to new languages
+- **PHP language support**: Added semantic parsing, chunking, and call-graph extraction for PHP, including fixtures and tests for constructors, imports, method calls, and simple calls
+
+### Changed
+- **Evaluation CI strategy**: Split the default GitHub Models quality gate from explicit external-provider budget checks and documented the active CI budget paths
+- **Documentation refresh**: Reorganized contributor and maintenance docs, expanded evaluation and benchmarking guidance, and updated README benchmark snapshots and workflow references
+
+### Fixed
+- **Release Drafter permissions**: Restored draft-release updates so release automation can keep draft notes current
+- **Eval/CI correctness**: Closed CI gating gaps, normalized baseline paths, and pinned the Rust toolchain action input used by CI
+- **Benchmark auditability**: Fixed scoped ast-grep metric accounting and dataset/result mutability issues in the benchmark runner and reporting flow
+- **Supply-chain hardening**: Tightened dependency and repository security posture, including stronger git/worktree handling coverage in tests
+- **Native test reliability**: `test:run` and `test:coverage` now rebuild the native module first so newly added parser/call-graph language support is exercised against a current binary during release verification
+
+## [0.5.2] - 2026-03-21
+
+### Added
+- **Call graph extraction and query**: Tree-sitter query-based extraction of function calls, method calls, constructors, and imports across 5 languages (TypeScript/JavaScript, Python, Go, Rust)
+- **`call_graph` tool**: Query callers or callees of any function/method with branch-aware filtering
+- **DB schema v2**: `symbols`, `call_edges`, and `branch_symbols` tables with full CRUD, GC, and batch operations
+- **Same-file call resolution**: Automatically resolves call edges to symbols defined in the same file during indexing
+- **`/call-graph` slash command**: Added command support for call graph workflows
+
+### Changed
+- **Documentation updates**: Expanded README, CHANGELOG, and skill guide to document call graph usage and behavior
+
+### Fixed
+- **Missing `call_graph` export**: The `call_graph` tool was not exported from the plugin entry point — now available to OpenCode users
+- **JavaScript call extraction routing**: JavaScript now uses a dedicated query file instead of TypeScript query routing
+- **Caller output context**: Caller results now include caller symbol/file context for clearer navigation
+- **Call graph consistency/integrity**: Improved branch filtering and database integrity handling for call graph data
+
 ## [0.5.1] - 2026-03-01
 
 ### Added
@@ -17,17 +131,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Changelog and README**: Fixed bullet formatting, added platform support table
-
-## [Unreleased]
-
-### Added
-- **Call graph extraction and query**: Tree-sitter query-based extraction of function calls, method calls, constructors, and imports across 5 languages (TypeScript/JavaScript, Python, Go, Rust)
-- **`call_graph` tool**: Query callers or callees of any function/method with branch-aware filtering
-- **DB schema v2**: `symbols`, `call_edges`, and `branch_symbols` tables with full CRUD, GC, and batch operations
-- **Same-file call resolution**: Automatically resolves call edges to symbols defined in the same file during indexing
-
-### Fixed
-- **Missing `call_graph` export**: The `call_graph` tool was not exported from the plugin entry point — now available to OpenCode users
 
 ## [0.5.0] - 2026-02-23
 
@@ -198,6 +301,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - File watcher for automatic re-indexing
 - OpenCode tools: `codebase_search`, `index_codebase`, `index_status`, `index_health_check`
 
+[Unreleased]: https://github.com/Helweg/opencode-codebase-index/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/Helweg/opencode-codebase-index/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/Helweg/opencode-codebase-index/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/Helweg/opencode-codebase-index/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/Helweg/opencode-codebase-index/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/Helweg/opencode-codebase-index/compare/v0.5.2...v0.6.0
+[0.5.2]: https://github.com/Helweg/opencode-codebase-index/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/Helweg/opencode-codebase-index/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Helweg/opencode-codebase-index/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Helweg/opencode-codebase-index/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Helweg/opencode-codebase-index/compare/v0.3.2...v0.4.0

@@ -8,6 +8,7 @@ import {
   hashContent,
   hashFile,
   VectorStore,
+  createEmbeddingTexts,
   createEmbeddingText,
   createDynamicBatches,
   generateChunkId,
@@ -66,10 +67,204 @@ const add = (a, b) => a + b;
       expect(chunks.length).toBeGreaterThanOrEqual(1);
     });
 
-    it("should return empty array for unparseable content", () => {
+    it("should chunk plain text files", () => {
       const chunks = parseFile("data.txt", "just plain text");
 
       expect(chunks).toBeInstanceOf(Array);
+      expect(chunks.length).toBeGreaterThanOrEqual(1);
+      expect(chunks[0]?.content).toContain("just plain text");
+      expect(chunks[0]?.chunkType).toBe("block");
+    });
+
+    it("should chunk markdown files", () => {
+      const content = "# Project KB\n\nProject knowledge base delta.";
+      const chunks = parseFile("README.md", content);
+
+      expect(chunks.length).toBeGreaterThanOrEqual(1);
+      expect(chunks[0]?.content).toContain("Project knowledge base delta");
+      expect(chunks[0]?.chunkType).toBe("block");
+    });
+
+    it("should parse PHP files", () => {
+      const content = `
+<?php
+
+function greet($name) {
+    return "Hello, " . $name;
+}
+
+class User {
+    private $name;
+
+    public function __construct($name) {
+        $this->name = $name;
+    }
+
+    public function getName() {
+        return $this->name;
+    }
+}
+
+interface Logger {
+    public function log($message);
+}
+`;
+      const chunks = parseFile("test.php", content);
+
+      expect(chunks.length).toBeGreaterThanOrEqual(3);
+      expect(chunks.some((c) => c.content.includes("function greet"))).toBe(true);
+      expect(chunks.some((c) => c.content.includes("class User"))).toBe(true);
+      expect(chunks.some((c) => c.content.includes("interface Logger"))).toBe(true);
+    });
+
+    it("should parse PHP .inc files", () => {
+      const content = `
+<?php
+
+function helper($value) {
+    return $value * 2;
+}
+
+trait Timestampable {
+    private $createdAt;
+
+    public function setCreatedAt($time) {
+        $this->createdAt = $time;
+    }
+}
+`;
+      const chunks = parseFile("config.inc", content);
+
+      expect(chunks.length).toBeGreaterThanOrEqual(2);
+      expect(chunks.some((c) => c.content.includes("function helper"))).toBe(true);
+      expect(chunks.some((c) => c.content.includes("trait Timestampable"))).toBe(true);
+    });
+
+    it("should parse Apex classes (.cls) with methods and constructors", () => {
+      const content = `
+public with sharing class AccountService {
+    private static final String DEFAULT_NAME = 'Untitled';
+
+    public AccountService() {}
+
+    public static Account createAccount(String name) {
+        Account a = new Account(Name = name);
+        insert a;
+        return a;
+    }
+
+    public Integer countActiveAccounts() {
+        return [SELECT COUNT() FROM Account WHERE Active__c = TRUE];
+    }
+}
+`;
+      const chunks = parseFile("AccountService.cls", content);
+
+      expect(chunks.length).toBeGreaterThanOrEqual(1);
+      expect(chunks.some((c) => c.chunkType === "class_declaration")).toBe(true);
+      expect(chunks.some((c) => c.content.includes("createAccount"))).toBe(true);
+      expect(chunks.some((c) => c.content.includes("countActiveAccounts"))).toBe(true);
+    });
+
+    it("should parse Apex triggers (.trigger)", () => {
+      const content = `
+trigger AccountTrigger on Account (before insert, before update, after delete) {
+    for (Account a : Trigger.new) {
+        a.Description = 'Updated by trigger';
+    }
+}
+`;
+      const chunks = parseFile("AccountTrigger.trigger", content);
+
+      expect(chunks.length).toBeGreaterThanOrEqual(1);
+      expect(chunks.some((c) => c.chunkType === "trigger_declaration")).toBe(true);
+      expect(chunks.some((c) => c.name === "AccountTrigger")).toBe(true);
+      expect(chunks.some((c) => c.content.includes("before insert"))).toBe(true);
+    });
+
+    it("should attach Apex JavaDoc block comments to declarations", () => {
+      const content = `
+/**
+ * Service for managing Account records.
+ * Used by Aura controllers and batch jobs.
+ */
+public class AccountService {
+    /**
+     * Creates a new Account with the given name.
+     */
+    public static Account createAccount(String name) {
+        return new Account(Name = name);
+    }
+}
+`;
+      const chunks = parseFile("AccountService.cls", content);
+
+      const classChunk = chunks.find((c) => c.chunkType === "class_declaration");
+      expect(classChunk).toBeDefined();
+      expect(classChunk?.content).toContain("Service for managing Account");
+    });
+
+    it("should parse a realistic 200+ line Apex fixture without errors", () => {
+      const fixturePath = path.join(
+        __dirname,
+        "fixtures",
+        "apex",
+        "AccountServiceFixture.cls",
+      );
+      const content = fs.readFileSync(fixturePath, "utf-8");
+      const chunks = parseFile("AccountServiceFixture.cls", content);
+
+      expect(chunks.length).toBeGreaterThan(0);
+
+      // The outer class is very large (>2KB) and will be split into multiple
+      // chunks by split_large_chunk; the chunks inherit chunk_type from the
+      // parent semantic node, so we expect class_declaration chunks.
+      expect(chunks.some((c) => c.chunkType === "class_declaration")).toBe(true);
+
+      // Recognizable identifiers should appear somewhere in the output.
+      const allContent = chunks.map((c) => c.content).join("\n");
+      expect(allContent).toContain("AccountServiceFixture");
+      expect(allContent).toContain("createAccount");
+      expect(allContent).toContain("AccountServiceException");
+      expect(allContent).toContain("ProcessingStatus");
+
+      // Language label is consistent.
+      expect(chunks.every((c) => c.language === "apex")).toBe(true);
+    });
+
+    it("should parse Zig files", () => {
+      const content = `
+const std = @import("std");
+
+/// Adds two integers.
+pub fn add(a: i32, b: i32) i32 {
+    return a + b;
+}
+
+const Point = struct {
+    x: f32,
+    y: f32,
+};
+
+test "add works" {
+    try std.testing.expect(add(1, 2) == 3);
+}
+`;
+      const chunks = parseFile("main.zig", content);
+
+      // Should produce semantic chunks for each declaration
+      expect(chunks.length).toBeGreaterThanOrEqual(2);
+
+      const chunkTypes = chunks.map((c) => c.chunkType);
+      expect(chunkTypes).toContain("function_declaration");
+      expect(chunkTypes).toContain("test_declaration");
+
+      // Doc comment must be attached to the fn add chunk
+      const addChunk = chunks.find(
+        (c) => c.chunkType === "function_declaration" && c.content.includes("fn add"),
+      );
+      expect(addChunk).toBeDefined();
+      expect(addChunk!.content).toContain("Adds two integers");
     });
   });
 
@@ -222,6 +417,145 @@ const add = (a, b) => a + b;
       expect(newStore.count()).toBe(1);
     });
 
+    it("should add vectors in batch and keep metadata searchable", () => {
+      store.addBatch([
+        {
+          id: "chunk1",
+          vector: [1, 0, 0],
+          metadata: {
+            filePath: "a.ts",
+            startLine: 1,
+            endLine: 5,
+            chunkType: "function",
+            language: "typescript",
+            hash: "abc123",
+          },
+        },
+        {
+          id: "chunk2",
+          vector: [0, 1, 0],
+          metadata: {
+            filePath: "b.ts",
+            startLine: 10,
+            endLine: 15,
+            chunkType: "class",
+            language: "typescript",
+            hash: "def456",
+          },
+        },
+        {
+          id: "chunk3",
+          vector: [0, 0, 1],
+          metadata: {
+            filePath: "c.ts",
+            startLine: 20,
+            endLine: 25,
+            chunkType: "method",
+            language: "typescript",
+            hash: "ghi789",
+          },
+        },
+      ]);
+
+      expect(store.count()).toBe(3);
+
+      const results = store.search([1, 0.1, 0], 2);
+      expect(results.length).toBe(2);
+      expect(results[0]?.id).toBe("chunk1");
+
+      const metadataMap = store.getMetadataBatch(["chunk1", "chunk3"]);
+      expect(metadataMap.size).toBe(2);
+      expect(metadataMap.get("chunk1")?.filePath).toBe("a.ts");
+      expect(metadataMap.get("chunk3")?.chunkType).toBe("method");
+    });
+
+    it("should replace existing keys when updating via batch", () => {
+      store.add("chunk1", [1, 0, 0], {
+        filePath: "original.ts",
+        startLine: 1,
+        endLine: 5,
+        chunkType: "function",
+        language: "typescript",
+        hash: "old-hash",
+      });
+
+      store.addBatch([
+        {
+          id: "chunk1",
+          vector: [0, 1, 0],
+          metadata: {
+            filePath: "updated.ts",
+            startLine: 6,
+            endLine: 12,
+            chunkType: "class",
+            language: "typescript",
+            hash: "new-hash",
+          },
+        },
+        {
+          id: "chunk2",
+          vector: [0, 0, 1],
+          metadata: {
+            filePath: "second.ts",
+            startLine: 20,
+            endLine: 25,
+            chunkType: "method",
+            language: "typescript",
+            hash: "second-hash",
+          },
+        },
+      ]);
+
+      expect(store.count()).toBe(2);
+
+      const updated = store.getMetadata("chunk1");
+      expect(updated?.filePath).toBe("updated.ts");
+      expect(updated?.hash).toBe("new-hash");
+      expect(updated?.chunkType).toBe("class");
+
+      const results = store.search([0, 1, 0], 2);
+      expect(results[0]?.id).toBe("chunk1");
+      expect(results[0]?.metadata.filePath).toBe("updated.ts");
+    });
+
+    it("should handle high-volume batch inserts without losing search or metadata", () => {
+      const batchSize = 1000;
+      const items = Array.from({ length: batchSize }, (_unused, index) => ({
+        id: `chunk${index}`,
+        vector: [Math.cos(index / 25), Math.sin(index / 25), index === 777 ? 1 : 0],
+        metadata: {
+          filePath: `file-${index}.ts`,
+          startLine: index + 1,
+          endLine: index + 2,
+          chunkType: index % 2 === 0 ? "function" : "class",
+          language: "typescript",
+          hash: `hash-${index}`,
+        },
+      }));
+
+      store.addBatch(items);
+
+      expect(store.count()).toBe(batchSize);
+
+      const metadataMap = store.getMetadataBatch(["chunk0", "chunk777", "chunk999"]);
+      expect(metadataMap.size).toBe(3);
+      expect(metadataMap.get("chunk0")?.hash).toBe("hash-0");
+      expect(metadataMap.get("chunk777")?.filePath).toBe("file-777.ts");
+      expect(metadataMap.get("chunk999")?.endLine).toBe(1001);
+
+      store.save();
+
+      const reloadedStore = new VectorStore(path.join(tempDir, "vectors"), 3);
+      reloadedStore.load();
+
+      expect(reloadedStore.count()).toBe(batchSize);
+      expect(reloadedStore.getMetadata("chunk777")?.filePath).toBe("file-777.ts");
+      expect(reloadedStore.getMetadata("chunk999")?.hash).toBe("hash-999");
+
+      const reloadedResults = reloadedStore.search(items[777].vector, 10);
+      expect(reloadedResults[0]?.id).toBe("chunk777");
+    });
+
     it("should clear all data", () => {
       store.add("chunk1", [1, 0, 0], {
         filePath: "test.ts",
@@ -310,7 +644,7 @@ const add = (a, b) => a + b;
       });
 
       const metadataMap = store.getMetadataBatch(["chunk1", "chunk3", "nonexistent"]);
-      
+
       expect(metadataMap.size).toBe(2);
       expect(metadataMap.get("chunk1")?.filePath).toBe("a.ts");
       expect(metadataMap.get("chunk3")?.filePath).toBe("c.ts");
@@ -382,6 +716,84 @@ const add = (a, b) => a + b;
       const batches = createDynamicBatches(chunks);
 
       expect(batches.length).toBe(2);
+    });
+
+    it("should respect maxBatchItems option", () => {
+      const chunks = [
+        { text: "a".repeat(100), id: "1" },
+        { text: "b".repeat(100), id: "2" },
+        { text: "c".repeat(100), id: "3" },
+      ];
+
+      const batches = createDynamicBatches(chunks, { maxBatchItems: 1 });
+
+      expect(batches).toHaveLength(3);
+      expect(batches.every((batch) => batch.length === 1)).toBe(true);
+    });
+
+    it("should respect maxBatchTokens override", () => {
+      const chunks = [
+        { text: "a".repeat(1000), id: "1" },
+        { text: "b".repeat(1000), id: "2" },
+      ];
+
+      const batches = createDynamicBatches(chunks, { maxBatchTokens: 300 });
+
+      expect(batches).toHaveLength(2);
+    });
+  });
+
+  describe("createEmbeddingText", () => {
+    it("should respect a lower max token override", () => {
+      const chunk: CodeChunk = {
+        content: "x".repeat(10000),
+        startLine: 1,
+        endLine: 50,
+        chunkType: "function",
+        name: "hugeChunk",
+        language: "typescript",
+      };
+
+      const text = createEmbeddingText(chunk, "/src/huge.ts", 256);
+
+      expect(text.length).toBeLessThan(256 * 4 + 64);
+      expect(text).toContain("... [truncated]");
+    });
+  });
+
+  describe("createEmbeddingTexts", () => {
+    it("splits oversized chunks into multiple embedding texts with part markers", () => {
+      const chunk: CodeChunk = {
+        content: "x".repeat(8000),
+        startLine: 1,
+        endLine: 200,
+        chunkType: "function",
+        name: "hugeChunk",
+        language: "typescript",
+      };
+
+      const texts = createEmbeddingTexts(chunk, "/src/huge.ts", 256);
+
+      expect(texts.length).toBeGreaterThan(1);
+      expect(texts[0]).toContain("Part 1/");
+      expect(texts[1]).toContain("Part 2/");
+      expect(texts.every((text) => text.length <= 256 * 4 + 128)).toBe(true);
+    });
+
+    it("returns a single text when the chunk fits the token budget", () => {
+      const chunk: CodeChunk = {
+        content: "function small() { return 1; }",
+        startLine: 1,
+        endLine: 3,
+        chunkType: "function",
+        name: "small",
+        language: "typescript",
+      };
+
+      const texts = createEmbeddingTexts(chunk, "/src/small.ts", 512);
+
+      expect(texts).toHaveLength(1);
+      expect(texts[0]).not.toContain("Part 1/");
     });
   });
 

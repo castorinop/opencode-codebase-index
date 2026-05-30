@@ -10,6 +10,26 @@
 
 **opencode-codebase-index** brings semantic understanding to your [OpenCode](https://opencode.ai) workflow — and now to any MCP-compatible client like Cursor, Claude Code, and Windsurf. Instead of guessing function names or grepping for keywords, ask your codebase questions in plain English.
 
+## 📌 Quick Navigation
+
+- [⚡ Quick Start](#-quick-start)
+- [🌐 MCP Server (Cursor, Claude Code, Windsurf, etc.)](#-mcp-server-cursor-claude-code-windsurf-etc)
+- [🎯 When to Use What](#-when-to-use-what)
+- [🧰 Tools Available](#-tools-available)
+- [🎮 Slash Commands](#-slash-commands)
+- [📚 Knowledge Base](#-knowledge-base)
+- [🔄 Reranking](#-reranking)
+- [⚙️ Configuration](#️-configuration)
+- [🤝 Contributing](#-contributing)
+
+## 👋 Choose Your Path
+
+- **I want to try it now** → go to [Quick Start](#-quick-start)
+- **I use Cursor/Claude Code/Windsurf** → go to [MCP Server setup](#-mcp-server-cursor-claude-code-windsurf-etc)
+- **I’m comparing tools and workflows** → go to [When to Use What](#-when-to-use-what)
+- **I’m tuning behavior/cost/performance** → go to [Configuration](#️-configuration)
+- **I want to contribute** → go to [Contributing](#-contributing)
+
 ## 🚀 Why Use This?
 
 - 🧠 **Semantic Search**: Finds "user authentication" logic even if the function is named `check_creds`.
@@ -36,9 +56,31 @@
 3. **Index your codebase**
    Run `/index` or ask the agent to index your codebase. This only needs to be done once — subsequent updates are incremental.
 
+   **Recommended check:** run `/status` after the first index so you can confirm the detected provider/model before you start searching.
+
 4. **Start Searching**
    Ask:
    > "Find the function that handles credit card validation errors"
+
+### Provider selection notes
+
+- **Default auto-detect order:** Ollama → GitHub Copilot → OpenAI → Google
+- **Ollama** is the preferred zero-cost local option and works especially well for large repos:
+
+  ```bash
+  ollama pull nomic-embed-text
+  ```
+
+  ```json
+  {
+    "embeddingProvider": "ollama"
+  }
+  ```
+
+- **GitHub Copilot** is a good default if OpenCode already has Copilot auth and you prefer hosted embeddings.
+- **OpenAI** is a good hosted option when you want predictable API behavior and standard cloud setup.
+- **Google** is available if you prefer Gemini-hosted embeddings.
+- If `/status` reports provider or compatibility problems, follow that guidance before using `/index force`.
 
 ## 🌐 MCP Server (Cursor, Claude Code, Windsurf, etc.)
 
@@ -112,12 +154,13 @@ src/api/checkout.ts:89      (Route handler for /pay)
 | Don't know the function name | `codebase_search` | Semantic search finds by meaning |
 | Exploring unfamiliar codebase | `codebase_search` | Discovers related code across files |
 | Just need to find locations | `codebase_peek` | Returns metadata only, saves ~90% tokens |
+| Need the authoritative definition site | `implementation_lookup` | Prioritizes real implementation definitions over docs/tests |
 | Understand code flow | `call_graph` | Find callers/callees of any function |
 | Know exact identifier | `grep` | Faster, finds all occurrences |
 | Need ALL matches | `grep` | Semantic returns top N only |
 | Mixed discovery + precision | `/find` (hybrid) | Best of both worlds |
 
-**Rule of thumb**: `codebase_peek` to find locations → `Read` to examine → `grep` for precision.
+**Rule of thumb**: `codebase_peek` to find locations → `Read` to examine → `grep` for precision. For symbol-definition questions, use `implementation_lookup` first.
 
 ## 📊 Token Usage
 
@@ -158,20 +201,38 @@ graph TD
     Q[User Query] -->|Embedding Model| V[Query Vector]
     V -->|Cosine Similarity| D
     Q -->|BM25| E
-    G -->|Branch Filter| F
-    D --> F[Hybrid Fusion]
+    D --> F[Hybrid Fusion RRF/Weighted]
     E --> F
-    F --> R[Ranked Results]
+    F --> X[Deterministic Rerank]
+    G -->|Branch + Metadata Filters| X
+    X --> R[Ranked Results]
     end
 ```
 
 1. **Parsing**: We use `tree-sitter` to intelligently parse your code into meaningful blocks (functions, classes, interfaces). JSDoc comments and docstrings are automatically included with their associated code.
 
-**Supported Languages**: TypeScript, JavaScript, Python, Rust, Go, Java, C#, Ruby, Bash, C, C++, JSON, TOML, YAML
+**Supported Languages (Tree-sitter semantic parsing)**: TypeScript, JavaScript, Python, Rust, Go, Java, C#, Ruby, PHP, Apex, Bash, C, C++, JSON, TOML, YAML, Zig
+
+**Additional Supported Formats (line-based chunking)**: TXT, HTML, HTM, Markdown, Shell scripts
+
+**Default File Patterns**:
+```
+**/*.{ts,tsx,js,jsx,mjs,cjs}    **/*.{py,pyi}
+**/*.{go,rs,java,kt,scala}      **/*.{c,cpp,cc,h,hpp}
+**/*.{rb,php,inc,swift}         **/*.{vue,svelte,astro}
+**/*.{sql,graphql,proto}        **/*.{yaml,yml,toml}
+**/*.{md,mdx}                   **/*.{sh,bash,zsh}
+**/*.{txt,html,htm}              **/*.{cls,trigger}
+**/*.zig
+```
+
+Use `include` to replace defaults, or `additionalInclude` to extend (e.g. `"**/*.pdf"`, `"**/*.csv"`).
+
+**Max File Size**: Default 1MB (1048576 bytes). Configure via `indexing.maxFileSize` (bytes).
 2. **Chunking**: Large blocks are split with overlapping windows to preserve context across chunk boundaries.
 3. **Embedding**: These blocks are converted into vector representations using your configured AI provider.
 4. **Storage**: Embeddings are stored in SQLite (deduplicated by content hash) and vectors in `usearch` with F16 quantization for 50% memory savings. A branch catalog tracks which chunks exist on each branch.
-5. **Hybrid Search**: Combines semantic similarity (vectors) with BM25 keyword matching, filtered by current branch.
+5. **Hybrid Search**: Combines semantic similarity (vectors) with BM25 keyword matching, fuses (`rrf` default, `weighted` fallback), applies deterministic rerank, then filters by current branch/metadata.
 
 **Performance characteristics:**
 - **Incremental indexing**: ~50ms check time — only re-embeds changed files
@@ -218,6 +279,14 @@ When you switch branches, code changes but embeddings for unchanged content rema
 └── file-hashes.json      # File change detection
 ```
 
+### File Exclusions
+
+The following files/folders are excluded from indexing by default:
+
+- **Hidden files/folders**: Files starting with `.` (e.g., `.github`, `.vscode`, `.env`)
+- **Build folders**: Folders containing "build" in their name (e.g., `build`, `mingwBuildDebug`, `cmake-build-debug`)
+- **Default excludes**: `node_modules`, `dist`, `vendor`, `__pycache__`, `target`, `coverage`, etc.
+
 ## 🧰 Tools Available
 
 The plugin exposes these tools to the OpenCode agent:
@@ -226,6 +295,7 @@ The plugin exposes these tools to the OpenCode agent:
 **The primary tool.** Searches code by describing behavior.
 - **Use for**: Discovery, understanding flows, finding logic when you don't know the names.
 - **Example**: `"find the middleware that sanitizes input"`
+- **Ranking path**: hybrid retrieval → fusion (`search.fusionStrategy`) → deterministic rerank (`search.rerankTopN`) → filters
 
 **Writing good queries:**
 
@@ -240,14 +310,26 @@ The plugin exposes these tools to the OpenCode agent:
 ### `codebase_peek`
 **Token-efficient discovery.** Returns only metadata (file, line, name, type) without code content.
 - **Use for**: Finding WHERE code is before deciding what to read. Saves ~90% tokens vs `codebase_search`.
+- **Ranking path**: same hybrid ranking path as `codebase_search` (metadata-only output)
 - **Example output**:
   ```
   [1] function "validatePayment" at src/billing.ts:45-67 (score: 0.92)
   [2] class "PaymentProcessor" at src/processor.ts:12-89 (score: 0.87)
-  
+
   Use Read tool to examine specific files.
   ```
 - **Workflow**: `codebase_peek` → find locations → `Read` specific files
+
+### `implementation_lookup`
+**Definition-first lookup.** Jumps to the authoritative definition site for a symbol or natural-language definition query.
+- **Use for**: "Where is X defined?", symbol-definition requests, and cases where you want the implementation site rather than all usages.
+- **Behavior**: Prefers real implementation files over tests, docs, examples, and fixtures.
+- **Fallback**: If nothing authoritative is found, use `codebase_search` for broader discovery.
+
+### `find_similar`
+Find code similar to a provided snippet.
+- **Use for**: Duplicate detection, refactor prep, pattern mining.
+- **Ranking path**: semantic retrieval only + deterministic rerank (no BM25, no RRF).
 
 ### `index_codebase`
 Manually trigger indexing.
@@ -256,6 +338,7 @@ Manually trigger indexing.
 
 ### `index_status`
 Checks if the index is ready and healthy.
+- **Recommended workflow**: run this after `/index` to confirm the detected provider/model and whether the index is ready to search.
 
 ### `index_health_check`
 Maintenance tool to remove stale entries from deleted files and orphaned embeddings/chunks from the database.
@@ -269,10 +352,27 @@ Returns recent debug logs with optional filtering.
 - **Parameters**: `category` (optional: `search`, `embedding`, `cache`, `gc`, `branch`), `level` (optional: `error`, `warn`, `info`, `debug`), `limit` (default: 50).
 
 ### `call_graph`
-Query the call graph to find callers or callees of a function/method. Automatically built during indexing for TypeScript, JavaScript, Python, Go, and Rust.
+
+Query the call graph to find callers or callees of a function/method. Automatically built during indexing for TypeScript, JavaScript, Python, Go, Rust, PHP, and Zig.
+
 - **Use for**: Understanding code flow, tracing dependencies, impact analysis.
 - **Parameters**: `name` (function name), `direction` (`callers` or `callees`), `symbolId` (required for `callees`, returned by previous queries).
 - **Example**: Find who calls `validateToken` → `call_graph(name="validateToken", direction="callers")`
+
+### `add_knowledge_base`
+Add a folder as a knowledge base to be indexed alongside project code.
+- **Use for**: Indexing external documentation, API references, example programs.
+- **Parameters**: `path` (folder path, absolute or relative), `reindex` (optional, default `true`).
+- **Restrictions**: System directories (`/etc`, `/proc`, `/sys`, `/dev`) and sensitive home directories (`.ssh`, `.gnupg`, `.aws`, `.docker`, `.kube`) are blocked. Symlinks are resolved before validation.
+- **Example**: `add_knowledge_base(path="/path/to/docs")`
+
+### `list_knowledge_bases`
+List all configured knowledge base folders and their status.
+
+### `remove_knowledge_base`
+Remove a knowledge base folder from the index.
+- **Parameters**: `path` (folder path to remove), `reindex` (optional, default `false`).
+- **Example**: `remove_knowledge_base(path="/path/to/docs")`
 
 ## 🎮 Slash Commands
 
@@ -280,40 +380,227 @@ The plugin automatically registers these slash commands:
 
 | Command | Description |
 | ------- | ----------- |
+| `/definition <query>` | **Definition Lookup**. Finds the authoritative implementation site for a symbol or concept. |
+| `/peek <query>` | **Quick Semantic Lookup**. Returns likely locations only, without full code content. |
+| `/reindex` | **Full Rebuild**. Rebuilds the codebase index from scratch. |
 | `/search <query>` | **Pure Semantic Search**. Best for "How does X work?" |
 | `/find <query>` | **Hybrid Search**. Combines semantic search + grep. Best for "Find usage of X". |
-| `/index` | **Update Index**. Forces a refresh of the codebase index. |
+| `/call-graph <query>` | **Call Graph Trace**. Find callers/callees to understand execution flow. |
+| `/index` | **Update Index**. Runs incremental indexing by default; use `/index force` for a full rebuild. |
 | `/status` | **Check Status**. Shows if indexed, chunk count, and provider info. |
+
+## 📚 Knowledge Base
+
+The plugin can index **external documentation** alongside your project code. The indexed codebase includes:
+
+- **Project Source Code** — all code files in the current workspace
+- **API References** — hardware API docs, library documentation
+- **Usage Guides** — tutorials, how-to guides
+- **Example Programs** — code samples, demo projects
+
+### Adding Knowledge Base Folders
+
+Use the built-in tools to add documentation folders:
+
+```
+add_knowledge_base(path="/path/to/api-docs")
+add_knowledge_base(path="/path/to/examples")
+```
+
+The folder will be indexed into the **same database** as your project code. All searches automatically include both sources.
+
+### Managing Knowledge Bases
+
+```
+list_knowledge_bases          # Show configured knowledge bases
+remove_knowledge_base(path="/path/to/api-docs")  # Remove a knowledge base
+```
+
+### Configuration Example
+
+Project-level config (`.opencode/codebase-index.json`):
+```json
+{
+  "knowledgeBases": [
+    "/home/user/docs/esp-idf",
+    "/home/user/docs/arduino"
+  ]
+}
+```
+
+Global-level config (`~/.config/opencode/codebase-index.json`):
+```json
+{
+  "embeddingProvider": "custom",
+  "customProvider": {
+    "baseUrl": "{env:EMBED_BASE_URL}",
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
+    "apiKey": "{env:EMBED_API_KEY}"
+  }
+}
+```
+
+Config merging: Global config is the base, project config overrides. Knowledge bases from both levels are merged.
+
+### Syncing Changes
+
+- **Project code**: Auto-synced via file watcher (real-time)
+- **Knowledge base folders**: Manual sync — run `/index force` after changes
+
+## 🔄 Reranking
+
+The plugin supports **API-based reranking** for improved search result quality. Reranking uses a cross-encoder model to rescore the top search results.
+
+### Enable Reranking
+
+Add to your config (`.opencode/codebase-index.json` or global config):
+
+```json
+{
+  "reranker": {
+    "enabled": true,
+    "baseUrl": "https://api.cohere.ai/v1",
+    "model": "rerank-v3.5",
+    "apiKey": "{env:RERANK_API_KEY}",
+    "topN": 20
+  }
+}
+```
+
+### Reranker Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` | Enable reranking |
+| `baseUrl` | - | Rerank API endpoint |
+| `model` | - | Reranking model name |
+| `apiKey` | - | API key (use `{env:VAR}` for security) |
+| `topN` | `20` | Number of top results to rerank |
+| `timeoutMs` | `30000` | Request timeout |
+
+### How It Works
+
+```
+Query → Embedding Search → BM25 Search → Fusion → Reranking → Results
+```
+
+1. **Embedding Search**: Semantic similarity via vector search
+2. **BM25 Search**: Keyword matching via inverted index
+3. **Fusion**: Combine semantic + keyword results (RRF or weighted)
+4. **Reranking**: Cross-encoder rescores top N results via API
+5. **Results**: Final ranked results
+
+### Supported Reranking APIs
+
+Any OpenAI-compatible reranking endpoint. Examples:
+- **SiliconFlow**: `BAAI/bge-reranker-v2-m3`
+- **Cohere**: `rerank-english-v3.0`
+- **Local models**: Any server implementing `/v1/rerank` format
 
 ## ⚙️ Configuration
 
 Zero-config by default (uses `auto` mode). Customize in `.opencode/codebase-index.json`:
 
+### Full Configuration Example
+
 ```json
 {
-  "embeddingProvider": "auto",
-  "scope": "project",
-  "indexing": {
-    "autoIndex": false,
-    "watchFiles": true,
-    "maxFileSize": 1048576,
-    "maxChunksPerFile": 100,
-    "semanticOnly": false,
-    "autoGc": true,
-    "gcIntervalDays": 7,
-    "gcOrphanThreshold": 100,
-    "requireProjectMarker": true
+  // === Embedding Provider ===
+  "embeddingProvider": "custom",              // auto | github-copilot | openai | google | ollama | custom
+  "scope": "project",                         // project (per-repo) | global (shared)
+
+  // === Custom Embedding API (when embeddingProvider is "custom") ===
+  "customProvider": {
+    "baseUrl": "{env:EMBED_BASE_URL}",
+    "model": "BAAI/bge-m3",
+    "dimensions": 1024,
+    "apiKey": "{env:EMBED_API_KEY}",
+    "maxTokens": 8192,                        // Max tokens per input text
+    "timeoutMs": 30000,                       // Request timeout (ms)
+    "concurrency": 3,                         // Max concurrent requests
+    "requestIntervalMs": 1000,                // Min delay between requests (ms)
+    "maxBatchSize": 64                        // Max inputs per /embeddings request
   },
+
+  // === File Patterns ===
+  "include": [                                // Override default include patterns
+    "**/*.{ts,js,py,go,rs}"
+  ],
+  "exclude": [                                // Override default exclude patterns
+    "**/node_modules/**"
+  ],
+  "additionalInclude": [                      // Extend defaults (not replace)
+    "**/*.{txt,html,htm}",
+    "**/*.pdf"
+  ],
+
+  // === Knowledge Bases ===
+  "knowledgeBases": [                         // External docs to index alongside code
+    "/home/user/docs/esp-idf",
+    "/home/user/docs/arduino"
+  ],
+
+  // === Indexing ===
+  "indexing": {
+    "autoIndex": false,                       // Auto-index on plugin load
+    "watchFiles": true,                       // Re-index on file changes
+    "maxFileSize": 1048576,                   // Max file size in bytes (default: 1MB)
+    "maxChunksPerFile": 100,                  // Max chunks per file
+    "semanticOnly": false,                    // Only index functions/classes (skip blocks)
+    "retries": 3,                             // Embedding API retry attempts
+    "retryDelayMs": 1000,                     // Delay between retries (ms)
+    "autoGc": true,                           // Auto garbage collection
+    "gcIntervalDays": 7,                      // GC interval (days)
+    "gcOrphanThreshold": 100,                 // GC trigger threshold
+    "requireProjectMarker": true,             // Require .git/package.json to index
+    "maxDepth": 5,                            // Max directory depth (-1=unlimited, 0=root only)
+    "maxFilesPerDirectory": 100,              // Max files per directory (smallest first)
+    "fallbackToTextOnMaxChunks": true         // Fallback to text chunking on maxChunksPerFile
+  },
+
+  // === Search ===
   "search": {
-    "maxResults": 20,
-    "minScore": 0.1,
-    "hybridWeight": 0.5,
-    "contextLines": 0
+    "maxResults": 20,                         // Max results to return
+    "minScore": 0.1,                          // Min similarity score (0-1)
+    "hybridWeight": 0.5,                      // Keyword (1.0) vs semantic (0.0)
+    "fusionStrategy": "rrf",                  // rrf | weighted
+    "rrfK": 60,                               // RRF smoothing constant
+    "rerankTopN": 20,                         // Deterministic rerank depth
+    "contextLines": 0,                        // Extra lines before/after match
+    "routingHints": true                      // Runtime nudges for local discovery/definition queries
+  },
+  "reranker": {
+    "enabled": false,
+    "provider": "cohere",
+    "model": "rerank-v3.5",
+    "apiKey": "{env:RERANK_API_KEY}",
+    "topN": 15,
+    "timeoutMs": 10000
   },
   "debug": {
-    "enabled": false,
-    "logLevel": "info",
-    "metrics": false
+    "enabled": false,                         // Enable debug logging
+    "logLevel": "info",                       // error | warn | info | debug
+    "logSearch": true,                        // Log search operations
+    "logEmbedding": true,                     // Log embedding API calls
+    "logCache": true,                         // Log cache hits/misses
+    "logGc": true,                            // Log garbage collection
+    "logBranch": true,                        // Log branch detection
+    "metrics": false                          // Enable metrics collection
+  }
+}
+```
+
+String values in `codebase-index.json` can reference environment variables with `{env:VAR_NAME}` when the placeholder is the entire string value. Variable names must match `[A-Z_][A-Z0-9_]*`. This is useful for secrets such as custom provider API keys so they do not need to be committed to the config file.
+
+```json
+{
+  "embeddingProvider": "custom",
+  "customProvider": {
+    "baseUrl": "{env:EMBED_BASE_URL}",
+    "model": "nomic-embed-text",
+    "dimensions": 768,
+    "apiKey": "{env:EMBED_API_KEY}"
   }
 }
 ```
@@ -324,6 +611,10 @@ Zero-config by default (uses `auto` mode). Customize in `.opencode/codebase-inde
 |--------|---------|-------------|
 | `embeddingProvider` | `"auto"` | Which AI to use: `auto`, `github-copilot`, `openai`, `google`, `ollama`, `custom` |
 | `scope` | `"project"` | `project` = index per repo, `global` = shared index across repos |
+| `include` | (defaults) | Override the default include patterns (replaces defaults) |
+| `exclude` | (defaults) | Override the default exclude patterns (replaces defaults) |
+| `additionalInclude` | `[]` | Additional file patterns to include (extends defaults, e.g. `"**/*.txt"`, `"**/*.html"`) |
+| `knowledgeBases` | `[]` | External directories to index as knowledge bases (absolute or relative paths) |
 | **indexing** | | |
 | `autoIndex` | `false` | Automatically index on plugin load |
 | `watchFiles` | `true` | Re-index when files change |
@@ -336,11 +627,26 @@ Zero-config by default (uses `auto` mode). Customize in `.opencode/codebase-inde
 | `gcIntervalDays` | `7` | Run GC on initialization if last GC was more than N days ago |
 | `gcOrphanThreshold` | `100` | Run GC after indexing if orphan count exceeds this threshold |
 | `requireProjectMarker` | `true` | Require a project marker (`.git`, `package.json`, etc.) to enable file watching and auto-indexing. Prevents accidentally indexing large directories like home. Set to `false` to index any directory. |
+| `maxDepth` | `5` | Max directory traversal depth. `-1` = unlimited, `0` = only files in root dir, `1` = one level of subdirectories, etc. |
+| `maxFilesPerDirectory` | `100` | Max files to index per directory. Always picks the smallest files first. |
+| `fallbackToTextOnMaxChunks` | `true` | When a file exceeds `maxChunksPerFile`, fallback to text-based (line-by-line) chunking instead of skipping the rest of the file. |
 | **search** | | |
 | `maxResults` | `20` | Maximum results to return |
 | `minScore` | `0.1` | Minimum similarity score (0-1). Lower = more results |
 | `hybridWeight` | `0.5` | Balance between keyword (1.0) and semantic (0.0) search |
+| `fusionStrategy` | `"rrf"` | Hybrid fusion mode: `"rrf"` (rank-based reciprocal rank fusion) or `"weighted"` (legacy score blending fallback) |
+| `rrfK` | `60` | RRF smoothing constant. Higher values flatten rank impact, lower values prioritize top-ranked candidates more strongly |
+| `rerankTopN` | `20` | Deterministic rerank depth cap. Applies lightweight name/path/chunk-type rerank to top-N only |
 | `contextLines` | `0` | Extra lines to include before/after each match |
+| `routingHints` | `true` | Inject lightweight runtime hints for local conceptual discovery and definition lookups. Set to `false` to disable plugin-side routing nudges. |
+| **reranker** | | Optional second-stage model reranker for the top candidate pool |
+| `enabled` | `false` | Turn external reranking on/off |
+| `provider` | `"custom"` | Hosted shortcuts: `cohere`, `jina`, or `custom` |
+| `model` | — | Reranker model name required when enabled |
+| `baseUrl` | provider default | Override reranker endpoint base URL. `cohere` → `https://api.cohere.ai/v1`, `jina` → `https://api.jina.ai/v1` |
+| `apiKey` | — | API key for hosted reranker providers |
+| `topN` | `15` | Number of top candidates to send to the external reranker |
+| `timeoutMs` | `10000` | Timeout for external rerank requests |
 | **debug** | | |
 | `enabled` | `false` | Enable debug logging and metrics collection |
 | `logLevel` | `"info"` | Log level: `error`, `warn`, `info`, `debug` |
@@ -350,6 +656,155 @@ Zero-config by default (uses `auto` mode). Customize in `.opencode/codebase-inde
 | `logGc` | `true` | Log garbage collection operations |
 | `logBranch` | `true` | Log branch detection and switches |
 | `metrics` | `false` | Enable metrics collection (indexing stats, search timing, cache performance) |
+
+### Recovery warnings in debug logs
+
+When debug logging is enabled, the indexer now emits warn-level recovery messages if persisted cache state cannot be read safely.
+
+- Corrupted or unreadable `file-hashes.json` causes the in-memory file hash cache to be reset.
+- Corrupted or unreadable `failed-batches.json` causes persisted retry batches to be skipped for that run.
+
+These warnings improve observability but do **not** change the recovery behavior: the indexer still falls back to a safe reset/skip path instead of crashing. If these warnings recur, remove the affected file under `.opencode/index/` (or the global index directory) and rebuild with `/index force`.
+
+### Retrieval ranking behavior
+
+- `codebase_search` and `codebase_peek` use the hybrid path: semantic + keyword retrieval → fusion (`fusionStrategy`) → deterministic rerank (`rerankTopN`) → optional external reranker (`reranker`) → filtering.
+- When `search.routingHints` is enabled (default), the plugin adds tiny per-turn runtime hints for local conceptual discovery and definition queries. Conceptual discovery is nudged toward `codebase_peek` / `codebase_search`, while definition questions are nudged toward `implementation_lookup`. Exact identifier and unrelated operational tasks are left alone.
+- `find_similar` stays semantic-only: semantic retrieval + deterministic rerank only (no keyword retrieval, no RRF).
+- For compatibility rollbacks, set `search.fusionStrategy` to `"weighted"` to use the legacy weighted fusion path.
+- When enabled, the external reranker sees path metadata plus a bounded on-disk code snippet for each candidate so it can distinguish real implementations from docs/tests more reliably.
+- Retrieval benchmark artifacts are separated by role:
+  - baseline (versioned): `benchmarks/baselines/retrieval-baseline.json`
+  - latest candidate run (generated): `benchmark-results/retrieval-candidate.json`
+
+## 📏 Evaluation Harness
+
+This repository includes a first-class eval system for retrieval quality with versioned golden sets, compare mode, parameter sweeps, CI budgets, and run artifacts.
+
+### Commands
+
+```bash
+npm run eval
+npm run eval:ci
+npm run eval:ci:ollama
+npm run eval:compare -- --against benchmarks/baselines/eval-baseline-summary.json
+```
+
+CI usage split:
+
+- `npm run eval:smoke`: harness smoke check with local mock embeddings (used in main CI)
+- `npm run eval:ci`: real quality gate against baseline/budget (for scheduled/manual quality workflow)
+
+For `eval-quality.yml`, the default CI path uses **GitHub Models** with the workflow `GITHUB_TOKEN` plus `models: read`, so you do not need a separate OpenAI API key just to run the scheduled gate.
+
+That default GitHub Models path uses `benchmarks/budgets/github-models.json`, which applies stable absolute thresholds instead of the stricter baseline-regression budget used for explicit external providers.
+
+Optional override secrets for another OpenAI-compatible endpoint:
+
+- `EVAL_EMBED_BASE_URL`
+- `EVAL_EMBED_API_KEY`
+- `EVAL_EMBED_MODEL` (optional, default `text-embedding-3-small`)
+- `EVAL_EMBED_DIMENSIONS` (optional, default `1536`)
+
+If you override the provider, set both `EVAL_EMBED_BASE_URL` and `EVAL_EMBED_API_KEY`. Otherwise the workflow falls back to GitHub Models automatically. Override providers continue to use the baseline-driven budget in `benchmarks/budgets/default.json`.
+
+No OpenAI API access? Use Ollama quality gate locally:
+
+- Config: `.github/eval-ollama-config.json`
+- Script: `npm run eval:ci:ollama`
+
+Prerequisites: Ollama installed, `ollama serve` running on `127.0.0.1:11434`, and `nomic-embed-text` pulled.
+
+Examples:
+
+```bash
+# Run against small golden set
+npm run eval -- --dataset benchmarks/golden/small.json
+
+# Compare against baseline
+npm run eval:compare -- --against benchmarks/baselines/eval-baseline-summary.json --dataset benchmarks/golden/medium.json
+
+# Sweep retrieval parameters
+npm run eval -- --dataset benchmarks/golden/small.json --sweepFusionStrategy rrf,weighted --sweepHybridWeight 0.3,0.5,0.7 --sweepRrfK 30,60 --sweepRerankTopN 10,20
+```
+
+### What it reports
+
+- Hit@1, Hit@3, Hit@5, Hit@10
+- MRR@10, nDCG@10
+- Latency p50/p95/p99
+- Token estimates, embedding call counts, estimated embedding cost
+- Failure buckets (`wrong-file`, `wrong-symbol`, `docs-tests-outranking-source`, `no-relevant-hit-top-k`)
+
+### Artifacts
+
+Each run writes:
+
+`benchmarks/results/<timestamp>/`
+
+- `summary.json`
+- `summary.md`
+- `per-query.json`
+- `compare.json` (when baseline/sweep used)
+
+### Golden sets and budgets
+
+- Golden datasets:
+  - `benchmarks/golden/small.json`
+  - `benchmarks/golden/medium.json`
+  - `benchmarks/golden/large.json`
+- CI budgets:
+  - `benchmarks/budgets/github-models.json` for the default GitHub Models workflow path
+  - `benchmarks/budgets/default.json` for explicit external provider overrides with baseline comparison
+
+Full docs: `docs/evaluation.md`
+
+### Cross-repo benchmark results snapshot
+
+Recent representative runs (plugin vs `ripgrep` vs `ast-grep`) on two medium repos:
+
+Methodology for the snapshot below:
+
+- Dataset: auto-generated cross-repo golden sets for `axios` + `express`
+- Repeats: **20** per mode
+- Aggregation: **median** metric per tool (then averaged across repos)
+- Reindex behavior: when enabled, index reset applies on repeat #1 only; subsequent repeats measure warm-index query behavior
+- Sampling note: repository parsing can be capped; benchmark reports include truncation metadata
+- ast-grep scope note: sg metrics are computed on its compatible query subset (`definition`, `keyword-heavy`) with scoped denominators shown in run reports
+
+#### Without reindex (`--no-reindex`, default)
+
+| Metric | Plugin | ripgrep | ast-grep (5/10 queries) |
+|---|---:|---:|---:|
+| Hit@5 | 50% | 5% | 100% |
+| MRR@10 | 0.48 | 0.04 | 0.90 |
+| nDCG@10 | 0.48 | 0.08 | 0.93 |
+| Latency p50 (ms) | 17.5 | 36.9 | 66.6 |
+| Latency p95 (ms) | 30.9 | 44.1 | 70.7 |
+
+#### With reindex (`--reindex`)
+
+| Metric | Plugin | ripgrep | ast-grep (5/10 queries) |
+|---|---:|---:|---:|
+| Hit@5 | 50% | 5% | 100% |
+| MRR@10 | 0.48 | 0.04 | 0.98 |
+| nDCG@10 | 0.48 | 0.07 | 0.98 |
+| Latency p50 (ms) | 17.1 | 35.9 | 69.1 |
+| Latency p95 (ms) | 30.4 | 43.7 | 75.1 |
+
+ast-grep metrics are computed on its compatible query subset only (`definition` + `keyword-heavy`, 5/10 queries per repo). Plugin and ripgrep are scored on all 10 queries.
+
+Interpretation:
+
+- ast-grep dominates on its scoped subset (structural definition queries), but only handles 50% of query types. Plugin handles all query types including natural language.
+- Plugin leads on rank-sensitive quality (MRR/nDCG) vs ripgrep across all query types.
+- ripgrep remains a useful speed-oriented lexical baseline but has significantly lower retrieval relevance for intent-style queries.
+- Plugin is the fastest tool at p50 (~17ms), ahead of ripgrep (~36ms) and ast-grep (~67ms).
+- Reported numbers are rounded to avoid false precision; use report artifacts for full per-repeat audit trails.
+
+For reproducible setup and commands (including with/without reindex), see:
+
+- `docs/benchmarking-cross-repo.md`
 
 ### Embedding Providers
 The plugin automatically detects available credentials in this order:
@@ -386,81 +841,30 @@ ollama pull nomic-embed-text
 }
 ```
 
+The built-in `ollama` provider uses Ollama's native `/api/embeddings` endpoint and is the simplest setup when you want to use `nomic-embed-text`.
+
+For the built-in Ollama path, the plugin budgets `nomic-embed-text` against an observed effective input limit of about **2048 tokens**, not the model's higher advertised theoretical context. This keeps batching and chunk text generation aligned with real Ollama embedding runtime behavior.
+
+If you want to use a different Ollama embedding model through its OpenAI-compatible API, use the `custom` provider instead and set `customProvider.baseUrl` to `http://127.0.0.1:11434/v1` so the plugin calls `.../v1/embeddings`.
+
 ## 📈 Performance
 
-The plugin is built for speed with a Rust native module. Here are typical performance numbers (Apple M1):
+The plugin is built for speed with a Rust native module (`tree-sitter`, `usearch`, SQLite). In practice, indexing and retrieval remain fast enough for interactive use on medium/large repositories.
 
-### Parsing (tree-sitter)
+- Typical query latency: ~800-1000ms (mostly embedding API time)
+- Incremental indexing: only changed files are re-embedded
+- Batch DB operations: significant write-speed improvements for large indexes
 
-| Files | Chunks | Time |
-|-------|--------|------|
-| 100 | 1,200 | ~7ms |
-| 500 | 6,000 | ~32ms |
-
-### Vector Search (usearch)
-
-| Index Size | Search Time | Throughput |
-|------------|-------------|------------|
-| 1,000 vectors | 0.7ms | 1,400 ops/sec |
-| 5,000 vectors | 1.2ms | 850 ops/sec |
-| 10,000 vectors | 1.3ms | 780 ops/sec |
-
-### Database Operations (SQLite with batch)
-
-| Operation | 1,000 items | 10,000 items |
-|-----------|-------------|--------------|
-| Insert chunks | 4ms | 44ms |
-| Add to branch | 2ms | 22ms |
-| Check embedding exists | <0.01ms | <0.01ms |
-
-### Batch vs Sequential Performance
-
-Batch operations provide significant speedups:
-
-| Operation | Sequential | Batch | Speedup |
-|-----------|------------|-------|---------|
-| Insert 1,000 chunks | 38ms | 4ms | **~10x** |
-| Add 1,000 to branch | 29ms | 2ms | **~14x** |
-| Insert 1,000 embeddings | 59ms | 40ms | **~1.5x** |
-
-Run benchmarks yourself: `npx tsx benchmarks/run.ts`
+For reproducible measurements on your machine, run: `npx tsx benchmarks/run.ts`.
 
 ## 🎯 Choosing a Provider
 
-Use this decision tree to pick the right embedding provider:
+Quick recommendation:
 
-```
-                    ┌─────────────────────────┐
-                    │ Do you have Copilot?    │
-                    └───────────┬─────────────┘
-                          ┌─────┴─────┐
-                         YES          NO
-                          │            │
-              ┌───────────▼───────┐    │
-              │ Codebase < 1k     │    │
-              │ files?            │    │
-              └─────────┬─────────┘    │
-                  ┌─────┴─────┐        │
-                 YES          NO       │
-                  │            │       │
-                  ▼            │       │
-           ┌──────────┐        │       │
-           │ Copilot  │        │       │
-           │ (free)   │        │       │
-           └──────────┘        │       │
-                               ▼       ▼
-                    ┌─────────────────────────┐
-                    │ Need fastest indexing?  │
-                    └───────────┬─────────────┘
-                          ┌─────┴─────┐
-                         YES          NO
-                          │            │
-                          ▼            ▼
-                   ┌──────────┐ ┌──────────────┐
-                   │ Ollama   │ │ OpenAI or    │
-                   │ (local)  │ │ Google       │
-                   └──────────┘ └──────────────┘
-```
+- **Want local + private + fast indexing** → use **Ollama**
+- **Already have Copilot and a smaller repo** → use **GitHub Copilot**
+- **General cloud setup** → use **OpenAI** or **Google**
+- **Custom/OpenAI-compatible endpoint** → use **custom** provider
 
 ### Provider Comparison
 
@@ -476,35 +880,13 @@ Use this decision tree to pick the right embedding provider:
 
 ### Setup by Provider
 
-**Ollama (Recommended for large codebases)**
-```bash
-ollama pull nomic-embed-text
-```
+Set the provider in `.opencode/codebase-index.json`:
+
 ```json
 { "embeddingProvider": "ollama" }
 ```
 
-**OpenAI**
-```bash
-export OPENAI_API_KEY=sk-...
-```
-```json
-{ "embeddingProvider": "openai" }
-```
-
-**Google**
-```bash
-export GOOGLE_API_KEY=...
-```
-```json
-{ "embeddingProvider": "google" }
-```
-
-**GitHub Copilot**
-No setup needed if you have an active Copilot subscription.
-```json
-{ "embeddingProvider": "github-copilot" }
-```
+Credentials (if required) are read from environment variables (for example `OPENAI_API_KEY` or `GOOGLE_API_KEY`).
 
 **Custom (OpenAI-compatible)**
 Works with any server that implements the OpenAI `/v1/embeddings` API format (llama.cpp, vLLM, text-embeddings-inference, LiteLLM, etc.).
@@ -512,16 +894,37 @@ Works with any server that implements the OpenAI `/v1/embeddings` API format (ll
 {
   "embeddingProvider": "custom",
   "customProvider": {
-    "baseUrl": "http://localhost:11434/v1",
+    "baseUrl": "{env:EMBED_BASE_URL}",
     "model": "nomic-embed-text",
     "dimensions": 768,
-    "apiKey": "optional-api-key",
+    "apiKey": "{env:EMBED_API_KEY}",
     "maxTokens": 8192,
-    "timeoutMs": 30000
+    "timeoutMs": 30000,
+    "maxBatchSize": 64
   }
 }
 ```
-Required fields: `baseUrl`, `model`, `dimensions` (positive integer). Optional: `apiKey`, `maxTokens`, `timeoutMs` (default: 30000).
+Required fields: `baseUrl`, `model`, `dimensions` (positive integer). Optional: `apiKey`, `maxTokens`, `timeoutMs` (default: 30000), `maxBatchSize` (or `max_batch_size`) to cap inputs per `/embeddings` request for servers like text-embeddings-inference. `{env:VAR_NAME}` placeholders are resolved before config validation for fields that are actually used and throw if the referenced environment variable is missing or malformed.
+
+**Custom Ollama models via OpenAI-compatible API**
+If you are running Ollama locally and want to use an embedding model other than the built-in `ollama` setup, point the custom provider at Ollama's OpenAI-compatible base URL with the `/v1` suffix:
+
+```json
+{
+  "embeddingProvider": "custom",
+  "customProvider": {
+    "baseUrl": "http://127.0.0.1:11434/v1",
+    "model": "qwen3-embedding:0.6b",
+    "dimensions": 1024,
+    "apiKey": "ollama"
+  }
+}
+```
+
+Notes:
+- The plugin appends `/embeddings`, so `baseUrl` should be `http://127.0.0.1:11434/v1`, not just `http://127.0.0.1:11434`.
+- Ollama ignores the API key, but some OpenAI-compatible clients expect one, so a placeholder like `"ollama"` is fine.
+- Make sure `dimensions` matches the actual output size of the model you pulled locally.
 
 ## ⚠️ Tradeoffs
 
@@ -550,19 +953,39 @@ Be aware of these characteristics:
      ]
    }
    ```
-   
+
    This loads directly from your source directory, so changes take effect after rebuilding.
 
 ## 🤝 Contributing
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes and add tests
-4. Run checks: `npm run build && npm run test:run && npm run lint`
-5. Commit: `git commit -m "feat: add my feature"`
-6. Push and open a pull request
+For contribution workflow, standards, and release-label requirements, see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
-CI will automatically run tests and type checking on your PR.
+If you want to add support for a new language, see [`docs/adding-language-support.md`](./docs/adding-language-support.md) for the full Rust + TypeScript checklist.
+
+Quick path:
+
+1. Fork + branch
+2. Implement + tests
+3. Run checks: `npm run build && npm run typecheck && npm run lint && npm run test:run`
+4. Open PR with a release category label
+
+### Release process (structured + complete notes)
+
+To ensure release notes reflect all merged work, this repo uses a draft-release workflow.
+
+1. **Label every PR** with at least one semantic label:
+   - `feature`, `bug`, `performance`, `documentation`, `dependencies`, `refactor`, `test`, `chore`
+   - and (when relevant) `semver:major`, `semver:minor`, or `semver:patch`
+   - PRs are validated by CI (`Release Label Check`) and fail if no release category label is present
+2. **Let Release Drafter build the draft notes** automatically from merged PRs on `main`.
+3. **Before publishing**:
+   - compare `git log --oneline vX.Y.Z..HEAD` (or the previous release tag range) against the draft release notes so the release summary covers the full shipped delta, not just the current `CHANGELOG.md` `Unreleased` section
+   - copy/finalize relevant highlights into `CHANGELOG.md`
+   - bump `package.json` version
+   - run: `npm run build && npm run typecheck && npm run lint && npm run test:run`
+4. **Publish release** from the draft (or via `gh release create` after reviewing draft content).
+
+PRs labeled `skip-changelog` are intentionally excluded from release notes.
 
 ### Project Structure
 
@@ -594,7 +1017,7 @@ The Rust native module handles performance-critical operations:
 - **usearch**: High-performance vector similarity search with F16 quantization
 - **SQLite**: Persistent storage for embeddings, chunks, branch catalog, symbols, and call edges
 - **BM25 inverted index**: Fast keyword search for hybrid retrieval
-- **Call graph extraction**: Tree-sitter query-based extraction of function calls, method calls, constructors, and imports (TypeScript/JavaScript, Python, Go, Rust)
+- **Call graph extraction**: Tree-sitter query-based extraction of function calls, method calls, constructors, and imports (TypeScript/JavaScript, Python, Go, Rust, PHP, Zig)
 - **xxhash**: Fast content hashing for change detection
 
 Rebuild with: `npm run build:native` (requires Rust toolchain)

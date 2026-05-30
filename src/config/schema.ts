@@ -1,6 +1,25 @@
 // Config schema without zod dependency to avoid version conflicts with OpenCode SDK
 
-import { DEFAULT_INCLUDE, DEFAULT_EXCLUDE, EMBEDDING_MODELS, DEFAULT_PROVIDER_MODELS } from "./constants.js";
+import { AUTO_DETECT_PROVIDER_ORDER, DEFAULT_INCLUDE, DEFAULT_EXCLUDE, EMBEDDING_MODELS, DEFAULT_PROVIDER_MODELS } from "./constants.js";
+import {
+  getDefaultDebugConfig,
+  getDefaultIndexingConfig,
+  getDefaultRerankerBaseUrl,
+  getDefaultSearchConfig,
+} from "./defaults.js";
+import {
+  getResolvedString,
+  getResolvedStringArray,
+  isStringArray,
+  isValidFusionStrategy,
+  isValidLogLevel,
+  isValidModel,
+  isValidProvider,
+  isValidRerankerProvider,
+  isValidScope,
+} from "./validators.js";
+
+export { isValidModel } from "./validators.js";
 
 export type IndexScope = "project" | "global";
 
@@ -15,13 +34,26 @@ export interface IndexingConfig {
   autoGc: boolean;
   gcIntervalDays: number;
   gcOrphanThreshold: number;
-  /** 
-   * When true (default), requires a project marker (.git, package.json, Cargo.toml, etc.) 
+  /**
+   * When true (default), requires a project marker (.git, package.json, Cargo.toml, etc.)
    * to be present before enabling file watching and auto-indexing.
-   * This prevents accidentally watching/indexing large non-project directories like home.
-   * Set to false to allow indexing any directory.
    */
   requireProjectMarker: boolean;
+  /**
+   * Max directory traversal depth. -1 = unlimited, 0 = only files in the root dir,
+   * 1 = one level of subdirectories, etc. Default: 5
+   */
+  maxDepth: number;
+  /**
+   * Max number of files to index per directory. Always picks the smallest files first.
+   * Default: 100
+   */
+  maxFilesPerDirectory: number;
+  /**
+   * When a file hits maxChunksPerFile, fallback to text-based (chunk_by_lines) parsing
+   * instead of skipping the rest of the file. Default: true
+   */
+  fallbackToTextOnMaxChunks: boolean;
 }
 
 export interface SearchConfig {
@@ -29,7 +61,30 @@ export interface SearchConfig {
   minScore: number;
   includeContext: boolean;
   hybridWeight: number;
+  fusionStrategy: "weighted" | "rrf";
+  rrfK: number;
+  rerankTopN: number;
   contextLines: number;
+  routingHints: boolean;
+}
+
+export type RerankerProvider = "cohere" | "jina" | "custom";
+
+export interface RerankerConfig {
+  /** Whether to enable reranking. Default: false */
+  enabled: boolean;
+  /** Provider shortcut for hosted rerank APIs. Use 'custom' to provide only baseUrl. */
+  provider: RerankerProvider;
+  /** Model name for reranking */
+  model: string;
+  /** Base URL of the rerank API endpoint */
+  baseUrl: string;
+  /** API key for the rerank service */
+  apiKey?: string;
+  /** Number of top documents to rerank */
+  topN: number;
+  /** Request timeout in milliseconds */
+  timeoutMs: number;
 }
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
@@ -62,6 +117,8 @@ export interface CustomProviderConfig {
   concurrency?: number;
   /** Minimum delay between requests in milliseconds (default: 1000). Set to 0 for local servers. */
   requestIntervalMs?: number;
+  maxBatchSize?: number;
+  max_batch_size?: number;
 }
 
 export interface CodebaseIndexConfig {
@@ -73,83 +130,33 @@ export interface CodebaseIndexConfig {
   indexing?: Partial<IndexingConfig>;
   search?: Partial<SearchConfig>;
   debug?: Partial<DebugConfig>;
+  /** Reranking configuration for improving search result quality */
+  reranker?: Partial<RerankerConfig>;
+  /** External directories to index as knowledge bases (absolute or relative paths) */
+  knowledgeBases?: string[];
+  /** Override the default include patterns (replaces defaults) */
   include: string[];
+  /** Override the default exclude patterns (replaces defaults) */
   exclude: string[];
+  /** Additional file patterns to include (extends defaults) */
+  additionalInclude?: string[];
 }
 
 export type ParsedCodebaseIndexConfig = CodebaseIndexConfig & {
   indexing: IndexingConfig;
   search: SearchConfig;
   debug: DebugConfig;
+  reranker?: RerankerConfig;
+  knowledgeBases: string[];
+  additionalInclude: string[];
 };
-
-function getDefaultIndexingConfig(): IndexingConfig {
-  return {
-    autoIndex: false,
-    watchFiles: true,
-    maxFileSize: 1048576,
-    maxChunksPerFile: 100,
-    semanticOnly: false,
-    retries: 3,
-    retryDelayMs: 1000,
-    autoGc: true,
-    gcIntervalDays: 7,
-    gcOrphanThreshold: 100,
-    requireProjectMarker: true,
-  };
-}
-
-function getDefaultSearchConfig(): SearchConfig {
-  return {
-    maxResults: 20,
-    minScore: 0.1,
-    includeContext: true,
-    hybridWeight: 0.5,
-    contextLines: 0,
-  };
-}
-
-function getDefaultDebugConfig(): DebugConfig {
-  return {
-    enabled: false,
-    logLevel: "info",
-    logSearch: true,
-    logEmbedding: true,
-    logCache: true,
-    logGc: true,
-    logBranch: true,
-    metrics: true,
-  };
-}
-
-const VALID_SCOPES: IndexScope[] = ["project", "global"];
-const VALID_LOG_LEVELS: LogLevel[] = ["error", "warn", "info", "debug"];
-
-function isValidProvider(value: unknown): value is EmbeddingProvider {
-  return typeof value === "string" && Object.keys(EMBEDDING_MODELS).includes(value);
-}
-
-export function isValidModel<P extends EmbeddingProvider>(
-  value: unknown,
-  provider: P
-): value is ProviderModels[P] {
-  return typeof value === "string" && Object.keys(EMBEDDING_MODELS[provider]).includes(value);
-}
-
-function isValidScope(value: unknown): value is IndexScope {
-  return typeof value === "string" && VALID_SCOPES.includes(value as IndexScope);
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every(item => typeof item === "string");
-}
-
-function isValidLogLevel(value: unknown): value is LogLevel {
-  return typeof value === "string" && VALID_LOG_LEVELS.includes(value as LogLevel);
-}
 
 export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
   const input = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const embeddingProviderValue = getResolvedString(input.embeddingProvider, "$root.embeddingProvider");
+  const scopeValue = getResolvedString(input.scope, "$root.scope");
+  const includeValue = getResolvedStringArray(input.include, "$root.include");
+  const excludeValue = getResolvedStringArray(input.exclude, "$root.exclude");
 
   const defaultIndexing = getDefaultIndexingConfig();
   const defaultSearch = getDefaultSearchConfig();
@@ -168,6 +175,9 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     gcIntervalDays: typeof rawIndexing.gcIntervalDays === "number" ? Math.max(1, rawIndexing.gcIntervalDays) : defaultIndexing.gcIntervalDays,
     gcOrphanThreshold: typeof rawIndexing.gcOrphanThreshold === "number" ? Math.max(0, rawIndexing.gcOrphanThreshold) : defaultIndexing.gcOrphanThreshold,
     requireProjectMarker: typeof rawIndexing.requireProjectMarker === "boolean" ? rawIndexing.requireProjectMarker : defaultIndexing.requireProjectMarker,
+    maxDepth: typeof rawIndexing.maxDepth === "number" ? (rawIndexing.maxDepth < -1 ? -1 : rawIndexing.maxDepth) : defaultIndexing.maxDepth,
+    maxFilesPerDirectory: typeof rawIndexing.maxFilesPerDirectory === "number" ? Math.max(1, rawIndexing.maxFilesPerDirectory) : defaultIndexing.maxFilesPerDirectory,
+    fallbackToTextOnMaxChunks: typeof rawIndexing.fallbackToTextOnMaxChunks === "boolean" ? rawIndexing.fallbackToTextOnMaxChunks : defaultIndexing.fallbackToTextOnMaxChunks,
   };
 
   const rawSearch = (input.search && typeof input.search === "object" ? input.search : {}) as Record<string, unknown>;
@@ -176,7 +186,11 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     minScore: typeof rawSearch.minScore === "number" ? rawSearch.minScore : defaultSearch.minScore,
     includeContext: typeof rawSearch.includeContext === "boolean" ? rawSearch.includeContext : defaultSearch.includeContext,
     hybridWeight: typeof rawSearch.hybridWeight === "number" ? Math.min(1, Math.max(0, rawSearch.hybridWeight)) : defaultSearch.hybridWeight,
+    fusionStrategy: isValidFusionStrategy(rawSearch.fusionStrategy) ? rawSearch.fusionStrategy : defaultSearch.fusionStrategy,
+    rrfK: typeof rawSearch.rrfK === "number" ? Math.max(1, Math.floor(rawSearch.rrfK)) : defaultSearch.rrfK,
+    rerankTopN: typeof rawSearch.rerankTopN === "number" ? Math.min(200, Math.max(0, Math.floor(rawSearch.rerankTopN))) : defaultSearch.rerankTopN,
     contextLines: typeof rawSearch.contextLines === "number" ? Math.min(50, Math.max(0, rawSearch.contextLines)) : defaultSearch.contextLines,
+    routingHints: typeof rawSearch.routingHints === "boolean" ? rawSearch.routingHints : defaultSearch.routingHints,
   };
 
   const rawDebug = (input.debug && typeof input.debug === "object" ? input.debug : {}) as Record<string, unknown>;
@@ -191,23 +205,41 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
     metrics: typeof rawDebug.metrics === "boolean" ? rawDebug.metrics : defaultDebug.metrics,
   };
 
+  const rawKnowledgeBases = input.knowledgeBases;
+  const knowledgeBases: string[] = isStringArray(rawKnowledgeBases)
+    ? rawKnowledgeBases.filter(p => typeof p === "string" && p.trim().length > 0).map(p => p.trim())
+    : [];
+
+  const rawAdditionalInclude = input.additionalInclude;
+  const additionalInclude: string[] = isStringArray(rawAdditionalInclude)
+    ? rawAdditionalInclude.filter(p => typeof p === "string" && p.trim().length > 0).map(p => p.trim())
+    : [];
+
   let embeddingProvider: EmbeddingProvider | 'custom' | 'auto';
-  let embeddingModel: EmbeddingModelName | undefined = undefined;
-  let customProvider: CustomProviderConfig | undefined = undefined;
-  
-  if (input.embeddingProvider === 'custom') {
+  let embeddingModel: EmbeddingModelName | undefined;
+  let customProvider: CustomProviderConfig | undefined;
+  let reranker: RerankerConfig | undefined;
+  if (embeddingProviderValue === 'custom') {
     embeddingProvider = 'custom';
     const rawCustom = (input.customProvider && typeof input.customProvider === 'object' ? input.customProvider : null) as Record<string, unknown> | null;
-    if (rawCustom && typeof rawCustom.baseUrl === 'string' && rawCustom.baseUrl.trim().length > 0 && typeof rawCustom.model === 'string' && rawCustom.model.trim().length > 0 && typeof rawCustom.dimensions === 'number' && Number.isInteger(rawCustom.dimensions) && rawCustom.dimensions > 0) {
+    const baseUrlValue = getResolvedString(rawCustom?.baseUrl, "$root.customProvider.baseUrl");
+    const modelValue = getResolvedString(rawCustom?.model, "$root.customProvider.model");
+    const apiKeyValue = getResolvedString(rawCustom?.apiKey, "$root.customProvider.apiKey");
+    if (rawCustom && typeof baseUrlValue === 'string' && baseUrlValue.trim().length > 0 && typeof modelValue === 'string' && modelValue.trim().length > 0 && typeof rawCustom.dimensions === 'number' && Number.isInteger(rawCustom.dimensions) && rawCustom.dimensions > 0) {
       customProvider = {
-        baseUrl: rawCustom.baseUrl.trim().replace(/\/+$/, ''),
-        model: rawCustom.model,
+        baseUrl: baseUrlValue.trim().replace(/\/+$/, ''),
+        model: modelValue,
         dimensions: rawCustom.dimensions,
-        apiKey: typeof rawCustom.apiKey === 'string' ? rawCustom.apiKey : undefined,
+        apiKey: apiKeyValue,
         maxTokens: typeof rawCustom.maxTokens === 'number' ? rawCustom.maxTokens : undefined,
         timeoutMs: typeof rawCustom.timeoutMs === 'number' ? Math.max(1000, rawCustom.timeoutMs) : undefined,
         concurrency: typeof rawCustom.concurrency === 'number' ? Math.max(1, Math.floor(rawCustom.concurrency)) : undefined,
         requestIntervalMs: typeof rawCustom.requestIntervalMs === 'number' ? Math.max(0, Math.floor(rawCustom.requestIntervalMs)) : undefined,
+        maxBatchSize: typeof rawCustom.maxBatchSize === 'number'
+          ? Math.max(1, Math.floor(rawCustom.maxBatchSize))
+          : typeof rawCustom.max_batch_size === 'number'
+            ? Math.max(1, Math.floor(rawCustom.max_batch_size))
+            : undefined,
       };
       // Warn if baseUrl doesn't end with an API version path like /v1.
       // Note: using console.warn here because Logger isn't initialized yet at config parse time.
@@ -224,32 +256,74 @@ export function parseConfig(raw: unknown): ParsedCodebaseIndexConfig {
         "Required fields: baseUrl (string), model (string), dimensions (positive integer)."
       );
     }
-  } else if (isValidProvider(input.embeddingProvider)) {
-    embeddingProvider = input.embeddingProvider;
-    if (input.embeddingModel) {
-      embeddingModel = isValidModel(input.embeddingModel, embeddingProvider) ? input.embeddingModel : DEFAULT_PROVIDER_MODELS[embeddingProvider];
+  } else if (isValidProvider(embeddingProviderValue)) {
+    embeddingProvider = embeddingProviderValue;
+    const rawEmbeddingModel = input.embeddingModel;
+    if (typeof rawEmbeddingModel === "string") {
+      const embeddingModelValue = getResolvedString(rawEmbeddingModel, "$root.embeddingModel");
+      if (embeddingModelValue) {
+        embeddingModel = isValidModel(embeddingModelValue, embeddingProvider) ? embeddingModelValue : DEFAULT_PROVIDER_MODELS[embeddingProvider];
+      }
+    } else if (rawEmbeddingModel) {
+      embeddingModel = DEFAULT_PROVIDER_MODELS[embeddingProvider];
     }
   } else {
     embeddingProvider = 'auto';
+  }
+
+  const rawReranker = (input.reranker && typeof input.reranker === "object"
+    ? input.reranker
+    : {}) as Record<string, unknown>;
+  const rerankerEnabled = typeof rawReranker.enabled === "boolean" ? rawReranker.enabled : false;
+  if (rerankerEnabled) {
+    const provider = isValidRerankerProvider(rawReranker.provider) ? rawReranker.provider : "custom";
+    const model = getResolvedString(rawReranker.model, "$root.reranker.model");
+    if (!model || model.trim().length === 0) {
+      throw new Error("reranker is enabled but reranker.model is missing or invalid.");
+    }
+
+    const configuredBaseUrl = getResolvedString(rawReranker.baseUrl, "$root.reranker.baseUrl");
+    const baseUrl = configuredBaseUrl?.trim() || getDefaultRerankerBaseUrl(provider);
+    if (baseUrl.length === 0) {
+      throw new Error("reranker is enabled but reranker.baseUrl is missing or invalid for provider 'custom'.");
+    }
+
+    const apiKey = getResolvedString(rawReranker.apiKey, "$root.reranker.apiKey");
+    if ((provider === "cohere" || provider === "jina") && (!apiKey || apiKey.trim().length === 0)) {
+      throw new Error(`reranker provider '${provider}' requires reranker.apiKey when enabled.`);
+    }
+
+    reranker = {
+      enabled: true,
+      provider,
+      model: model.trim(),
+      baseUrl: baseUrl.replace(/\/+$/, ""),
+      apiKey: apiKey?.trim() || undefined,
+      topN: typeof rawReranker.topN === "number" ? Math.min(50, Math.max(1, Math.floor(rawReranker.topN))) : 15,
+      timeoutMs: typeof rawReranker.timeoutMs === "number" ? Math.max(1000, Math.floor(rawReranker.timeoutMs)) : 10000,
+    };
   }
 
   return {
     embeddingProvider,
     embeddingModel,
     customProvider,
-    scope: isValidScope(input.scope) ? input.scope : "project",
-    include: isStringArray(input.include) ? input.include : DEFAULT_INCLUDE,
-    exclude: isStringArray(input.exclude) ? input.exclude : DEFAULT_EXCLUDE,
+    scope: isValidScope(scopeValue) ? scopeValue : "project",
+    include: includeValue ?? DEFAULT_INCLUDE,
+    exclude: excludeValue ?? DEFAULT_EXCLUDE,
+    additionalInclude,
     indexing,
     search,
     debug,
+    reranker,
+    knowledgeBases,
   };
 }
 
 export function getDefaultModelForProvider(provider: EmbeddingProvider): EmbeddingModelInfo {
-  const models = EMBEDDING_MODELS[provider]
-  const providerDefault = DEFAULT_PROVIDER_MODELS[provider]
-  return models[providerDefault as keyof typeof models]
+  const models = EMBEDDING_MODELS[provider];
+  const providerDefault = DEFAULT_PROVIDER_MODELS[provider];
+  return models[providerDefault as keyof typeof models];
 }
 
 /**
@@ -260,13 +334,17 @@ export function getDefaultModelForProvider(provider: EmbeddingProvider): Embeddi
  */
 export type EmbeddingProvider = keyof typeof EMBEDDING_MODELS;
 
-export const availableProviders: EmbeddingProvider[] = Object.keys(EMBEDDING_MODELS) as EmbeddingProvider[]
+export const availableProviders: EmbeddingProvider[] = Object.keys(EMBEDDING_MODELS) as EmbeddingProvider[];
+
+export const autoDetectProviders: EmbeddingProvider[] = AUTO_DETECT_PROVIDER_ORDER.filter(
+  (provider): provider is EmbeddingProvider => provider in EMBEDDING_MODELS,
+);
 
 export type ProviderModels = {
   [P in keyof typeof EMBEDDING_MODELS]: keyof (typeof EMBEDDING_MODELS)[P]
 }
 
-export type EmbeddingModelName = ProviderModels[keyof ProviderModels]
+export type EmbeddingModelName = ProviderModels[keyof ProviderModels];
 
 export type EmbeddingProviderModelInfo = {
   [P in EmbeddingProvider]: (typeof EMBEDDING_MODELS)[P][keyof (typeof EMBEDDING_MODELS)[P]]
@@ -281,4 +359,4 @@ export interface BaseModelInfo {
   costPer1MTokens: number;
 }
 
-export type EmbeddingModelInfo = EmbeddingProviderModelInfo[EmbeddingProvider]
+export type EmbeddingModelInfo = EmbeddingProviderModelInfo[EmbeddingProvider];

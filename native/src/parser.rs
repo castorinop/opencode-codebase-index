@@ -1,8 +1,12 @@
 use crate::types::Language;
 use crate::{CodeChunk, FileInput, ParsedFile};
 use anyhow::{anyhow, Result};
+use lazy_static::lazy_static;
 use rayon::prelude::*;
+use std::collections::HashSet;
 use std::path::Path;
+#[cfg(debug_assertions)]
+use std::time::Instant;
 use tree_sitter::{Parser, Tree};
 
 const MIN_CHUNK_SIZE: usize = 50;
@@ -18,7 +22,7 @@ pub fn parse_file_internal(file_path: &str, content: &str) -> Result<Vec<CodeChu
 
     let language = Language::from_extension(ext);
 
-    if language == Language::Unknown {
+    if language == Language::Text {
         return Ok(chunk_by_lines(content, &language));
     }
 
@@ -41,6 +45,9 @@ pub fn parse_file_internal(file_path: &str, content: &str) -> Result<Vec<CodeChu
         Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         Language::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
         Language::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+        Language::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Language::Zig => tree_sitter_zig::LANGUAGE.into(),
+        Language::Apex => tree_sitter_sfapex::apex::LANGUAGE.into(),
         _ => return Ok(chunk_by_lines(content, &language)),
     };
 
@@ -51,6 +58,16 @@ pub fn parse_file_internal(file_path: &str, content: &str) -> Result<Vec<CodeChu
         .ok_or_else(|| anyhow!("Failed to parse file: {}", file_path))?;
 
     extract_chunks(&tree, content, &language)
+}
+
+pub fn parse_file_as_text_internal(file_path: &str, content: &str) -> Result<Vec<CodeChunk>> {
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+
+    let language = Language::from_extension(ext);
+    Ok(chunk_by_lines(content, &language))
 }
 
 pub fn parse_files_parallel(files: Vec<FileInput>) -> Result<Vec<ParsedFile>> {
@@ -75,7 +92,7 @@ fn extract_chunks(tree: &Tree, source: &str, language: &Language) -> Result<Vec<
     let root = tree.root_node();
     let mut cursor = root.walk();
 
-    extract_semantic_nodes(&mut cursor, source, language, &mut chunks);
+    extract_semantic_nodes(&mut cursor, source, language, &mut chunks, 0);
 
     if chunks.is_empty() {
         return Ok(chunk_by_lines(source, language));
@@ -91,7 +108,25 @@ fn extract_semantic_nodes(
     source: &str,
     language: &Language,
     chunks: &mut Vec<CodeChunk>,
+    depth: usize,
 ) {
+    #[cfg(debug_assertions)]
+    let start = Instant::now();
+    #[cfg(debug_assertions)]
+    {
+        let mut stats = PERF_STATS.lock().unwrap();
+        stats.extract_semantic_nodes_calls += 1;
+        stats.max_depth_reached = stats.max_depth_reached.max(depth);
+    }
+
+    const MAX_RECURSION_DEPTH: usize = 1024;
+    let skip_children = depth > MAX_RECURSION_DEPTH;
+    if skip_children {
+        #[cfg(debug_assertions)]
+        {
+            PERF_STATS.lock().unwrap().recursion_depth_exceeded_count += 1;
+        }
+    }
     loop {
         let node = cursor.node();
         let node_type = node.kind();
@@ -113,7 +148,7 @@ fn extract_semantic_nodes(
                 let name = extract_name(cursor, source);
 
                 let start_line = if leading_comment.is_some() {
-                    source[..start_byte].matches('\n').count() as u32 + 1
+                    source[..start_byte].lines().count() as u32
                 } else {
                     node.start_position().row as u32 + 1
                 };
@@ -135,14 +170,20 @@ fn extract_semantic_nodes(
             }
         }
 
-        if !is_semantic && cursor.goto_first_child() {
-            extract_semantic_nodes(cursor, source, language, chunks);
+        if !is_semantic && !skip_children && cursor.goto_first_child() {
+            extract_semantic_nodes(cursor, source, language, chunks, depth + 1);
             cursor.goto_parent();
         }
 
         if !cursor.goto_next_sibling() {
             break;
         }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let elapsed = start.elapsed().as_micros();
+        PERF_STATS.lock().unwrap().extract_semantic_nodes_time += elapsed;
     }
 }
 
@@ -151,16 +192,28 @@ fn find_leading_comment(
     source: &str,
     language: &Language,
 ) -> Option<(usize, String)> {
+    #[cfg(debug_assertions)]
+    let start = Instant::now();
+    #[cfg(debug_assertions)]
+    {
+        PERF_STATS.lock().unwrap().find_leading_comment_calls += 1;
+    }
+
     let mut prev = node.prev_sibling();
     let mut comments = Vec::new();
+    let mut count = 0;
+    const MAX_COMMENT_SIBLINGS: usize = 5;
 
     while let Some(sibling) = prev {
+        if count >= MAX_COMMENT_SIBLINGS {
+            break;
+        }
         if is_comment_node(sibling.kind(), language) {
             let start = sibling.start_byte();
             let end = sibling.end_byte();
-            let text = source[start..end].to_string();
-            comments.push((start, text));
+            comments.push((start, end));
             prev = sibling.prev_sibling();
+            count += 1;
         } else {
             break;
         }
@@ -174,9 +227,15 @@ fn find_leading_comment(
     let first_start = comments.first().map(|(s, _)| *s)?;
     let combined: String = comments
         .into_iter()
-        .map(|(_, t)| t)
+        .map(|(start, end)| &source[start..end])
         .collect::<Vec<_>>()
         .join("\n");
+
+    #[cfg(debug_assertions)]
+    {
+        let elapsed = start.elapsed().as_micros();
+        PERF_STATS.lock().unwrap().find_leading_comment_time += elapsed;
+    }
 
     Some((first_start, combined))
 }
@@ -186,163 +245,374 @@ fn is_comment_node(node_type: &str, language: &Language) -> bool {
         Language::TypeScript
         | Language::TypeScriptTsx
         | Language::JavaScript
-        | Language::JavaScriptJsx => {
-            matches!(node_type, "comment")
-        }
-        Language::Python => {
-            matches!(node_type, "comment")
-        }
-        Language::Rust => {
-            matches!(node_type, "line_comment" | "block_comment")
-        }
-        Language::Go => {
-            matches!(node_type, "comment")
-        }
-        Language::Java => {
-            matches!(node_type, "line_comment" | "block_comment")
-        }
-        Language::CSharp => {
-            matches!(node_type, "comment")
-        }
-        Language::Ruby => {
-            matches!(node_type, "comment")
-        }
-        Language::Bash => {
-            matches!(node_type, "comment")
-        }
-        Language::C | Language::Cpp => {
-            matches!(node_type, "comment")
-        }
-        Language::Toml => {
-            matches!(node_type, "comment")
-        }
-        Language::Yaml => {
-            matches!(node_type, "comment")
-        }
+        | Language::JavaScriptJsx => matches!(node_type, "comment"),
+        Language::Python => matches!(node_type, "comment"),
+        Language::Rust => matches!(node_type, "line_comment" | "block_comment"),
+        Language::Go => matches!(node_type, "comment"),
+        Language::Java => matches!(node_type, "line_comment" | "block_comment"),
+        Language::CSharp => matches!(node_type, "comment"),
+        Language::Ruby => matches!(node_type, "comment"),
+        Language::Bash => matches!(node_type, "comment"),
+        Language::C | Language::Cpp => matches!(node_type, "comment"),
+        Language::Toml => matches!(node_type, "comment"),
+        Language::Yaml => matches!(node_type, "comment"),
+        Language::Php => matches!(node_type, "comment"),
+        Language::Zig => matches!(node_type, "comment"),
+        Language::Apex => matches!(node_type, "line_comment" | "block_comment"),
         _ => false,
     }
+}
+
+struct PerfStats {
+    extract_semantic_nodes_calls: usize,
+    extract_semantic_nodes_time: u128,
+    find_leading_comment_calls: usize,
+    find_leading_comment_time: u128,
+    extract_name_calls: usize,
+    extract_name_time: u128,
+    is_semantic_node_calls: usize,
+    is_semantic_node_time: u128,
+    recursion_depth_exceeded_count: usize,
+    max_depth_reached: usize,
+}
+
+impl PerfStats {
+    fn new() -> Self {
+        Self {
+            extract_semantic_nodes_calls: 0,
+            extract_semantic_nodes_time: 0,
+            find_leading_comment_calls: 0,
+            find_leading_comment_time: 0,
+            extract_name_calls: 0,
+            extract_name_time: 0,
+            is_semantic_node_calls: 0,
+            is_semantic_node_time: 0,
+            recursion_depth_exceeded_count: 0,
+            max_depth_reached: 0,
+        }
+    }
+
+    fn print(&self) {
+        eprintln!("=== Parser Performance Stats ===");
+        eprintln!(
+            "extract_semantic_nodes: {} calls, {} us",
+            self.extract_semantic_nodes_calls, self.extract_semantic_nodes_time
+        );
+        eprintln!(
+            "find_leading_comment: {} calls, {} us",
+            self.find_leading_comment_calls, self.find_leading_comment_time
+        );
+        eprintln!(
+            "extract_name: {} calls, {} us",
+            self.extract_name_calls, self.extract_name_time
+        );
+        eprintln!(
+            "is_semantic_node: {} calls, {} us",
+            self.is_semantic_node_calls, self.is_semantic_node_time
+        );
+        eprintln!(
+            "recursion_depth_exceeded: {} times",
+            self.recursion_depth_exceeded_count
+        );
+        eprintln!("max_depth_reached: {}", self.max_depth_reached);
+    }
+}
+
+pub fn print_parser_perf_stats() {
+    PERF_STATS.lock().unwrap().print();
+}
+
+lazy_static! {
+    static ref PERF_STATS: std::sync::Mutex<PerfStats> = std::sync::Mutex::new(PerfStats::new());
+    static ref TS_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        // Original 10 types
+        set.insert("function_declaration");
+        set.insert("function");
+        set.insert("arrow_function");
+        set.insert("method_definition");
+        set.insert("class_declaration");
+        set.insert("interface_declaration");
+        set.insert("type_alias_declaration");
+        set.insert("enum_declaration");
+        set.insert("export_statement");
+        set.insert("lexical_declaration");
+        // Added 5 most common statement types
+        set.insert("expression_statement");
+        set.insert("if_statement");
+        set.insert("for_statement");
+        set.insert("return_statement");
+        set.insert("try_statement");
+        set.insert("while_statement");
+        set.insert("statement_block");
+        set.insert("for_in_statement");
+        set
+    };
+    static ref PYTHON_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_definition");
+        set.insert("class_definition");
+        set.insert("decorated_definition");
+        set
+    };
+    static ref RUST_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_item");
+        set.insert("impl_item");
+        set.insert("struct_item");
+        set.insert("enum_item");
+        set.insert("trait_item");
+        set.insert("mod_item");
+        set.insert("macro_definition");
+        set
+    };
+    static ref GO_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_declaration");
+        set.insert("method_declaration");
+        set.insert("type_declaration");
+        set.insert("type_spec");
+        set
+    };
+    static ref JAVA_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("class_declaration");
+        set.insert("method_declaration");
+        set.insert("constructor_declaration");
+        set.insert("interface_declaration");
+        set.insert("enum_declaration");
+        set.insert("annotation_type_declaration");
+        set
+    };
+    static ref CSHARP_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("class_declaration");
+        set.insert("method_declaration");
+        set.insert("constructor_declaration");
+        set.insert("interface_declaration");
+        set.insert("enum_declaration");
+        set.insert("struct_declaration");
+        set.insert("record_declaration");
+        set.insert("property_declaration");
+        set
+    };
+    static ref RUBY_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("method");
+        set.insert("singleton_method");
+        set.insert("class");
+        set.insert("module");
+        set
+    };
+    static ref BASH_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_definition");
+        set
+    };
+    static ref C_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_definition");
+        set.insert("struct_specifier");
+        set.insert("enum_specifier");
+        set.insert("type_definition");
+        set
+    };
+    static ref CPP_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_definition");
+        set.insert("class_specifier");
+        set.insert("struct_specifier");
+        set.insert("enum_specifier");
+        set.insert("namespace_definition");
+        set.insert("template_declaration");
+        set
+    };
+    static ref TOML_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("table");
+        set.insert("table_array_element");
+        set
+    };
+    static ref YAML_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("block_mapping_pair");
+        set.insert("block_sequence");
+        set
+    };
+    static ref PHP_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_definition");
+        set.insert("method_declaration");
+        set.insert("class_declaration");
+        set.insert("interface_declaration");
+        set.insert("trait_declaration");
+        set.insert("enum_declaration");
+        set
+    };
+    static ref ZIG_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("function_declaration");
+        set.insert("test_declaration");
+        set.insert("struct_declaration");
+        set.insert("enum_declaration");
+        set.insert("union_declaration");
+        set.insert("opaque_declaration");
+        set.insert("error_set_declaration");
+        set
+    };
+    // Apex grammar (tree-sitter-sfapex) is Java-derived: the declaration node
+    // kinds match Java exactly, plus `trigger_declaration` which is unique to
+    // Apex (Salesforce database triggers). Verified against tree-sitter-sfapex
+    // 3.0 by parsing representative classes/triggers/interfaces.
+    static ref APEX_SEMANTIC_NODES: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        set.insert("class_declaration");
+        set.insert("method_declaration");
+        set.insert("constructor_declaration");
+        set.insert("interface_declaration");
+        set.insert("enum_declaration");
+        set.insert("trigger_declaration");
+        set
+    };
 }
 
 fn is_semantic_node(node_type: &str, language: &Language) -> bool {
-    match language {
+    #[cfg(debug_assertions)]
+    let start = Instant::now();
+    #[cfg(debug_assertions)]
+    {
+        PERF_STATS.lock().unwrap().is_semantic_node_calls += 1;
+    }
+
+    let result = match language {
         Language::TypeScript
         | Language::TypeScriptTsx
         | Language::JavaScript
-        | Language::JavaScriptJsx => {
-            matches!(
-                node_type,
-                "function_declaration"
-                    | "function"
-                    | "arrow_function"
-                    | "method_definition"
-                    | "class_declaration"
-                    | "interface_declaration"
-                    | "type_alias_declaration"
-                    | "enum_declaration"
-                    | "export_statement"
-                    | "lexical_declaration"
-            )
-        }
-        Language::Python => {
-            matches!(
-                node_type,
-                "function_definition" | "class_definition" | "decorated_definition"
-            )
-        }
-        Language::Rust => {
-            matches!(
-                node_type,
-                "function_item"
-                    | "impl_item"
-                    | "struct_item"
-                    | "enum_item"
-                    | "trait_item"
-                    | "mod_item"
-                    | "macro_definition"
-            )
-        }
-        Language::Go => {
-            matches!(
-                node_type,
-                "function_declaration" | "method_declaration" | "type_declaration" | "type_spec"
-            )
-        }
-        Language::Java => {
-            matches!(
-                node_type,
-                "class_declaration"
-                    | "method_declaration"
-                    | "constructor_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "annotation_type_declaration"
-            )
-        }
-        Language::CSharp => {
-            matches!(
-                node_type,
-                "class_declaration"
-                    | "method_declaration"
-                    | "constructor_declaration"
-                    | "interface_declaration"
-                    | "enum_declaration"
-                    | "struct_declaration"
-                    | "record_declaration"
-                    | "property_declaration"
-            )
-        }
-        Language::Ruby => {
-            matches!(
-                node_type,
-                "method" | "singleton_method" | "class" | "module"
-            )
-        }
-        Language::Bash => {
-            matches!(node_type, "function_definition")
-        }
-        Language::C => {
-            matches!(
-                node_type,
-                "function_definition" | "struct_specifier" | "enum_specifier" | "type_definition"
-            )
-        }
-        Language::Cpp => {
-            matches!(
-                node_type,
-                "function_definition"
-                    | "class_specifier"
-                    | "struct_specifier"
-                    | "enum_specifier"
-                    | "namespace_definition"
-                    | "template_declaration"
-            )
-        }
-        Language::Toml => {
-            matches!(node_type, "table" | "table_array_element")
-        }
-        Language::Yaml => {
-            matches!(node_type, "block_mapping_pair" | "block_sequence")
-        }
+        | Language::JavaScriptJsx => TS_SEMANTIC_NODES.contains(node_type),
+        Language::Python => PYTHON_SEMANTIC_NODES.contains(node_type),
+        Language::Rust => RUST_SEMANTIC_NODES.contains(node_type),
+        Language::Go => GO_SEMANTIC_NODES.contains(node_type),
+        Language::Java => JAVA_SEMANTIC_NODES.contains(node_type),
+        Language::CSharp => CSHARP_SEMANTIC_NODES.contains(node_type),
+        Language::Ruby => RUBY_SEMANTIC_NODES.contains(node_type),
+        Language::Bash => BASH_SEMANTIC_NODES.contains(node_type),
+        Language::C => C_SEMANTIC_NODES.contains(node_type),
+        Language::Cpp => CPP_SEMANTIC_NODES.contains(node_type),
+        Language::Toml => TOML_SEMANTIC_NODES.contains(node_type),
+        Language::Yaml => YAML_SEMANTIC_NODES.contains(node_type),
+        Language::Php => PHP_SEMANTIC_NODES.contains(node_type),
+        Language::Zig => ZIG_SEMANTIC_NODES.contains(node_type),
+        Language::Apex => APEX_SEMANTIC_NODES.contains(node_type),
         _ => false,
+    };
+
+    #[cfg(debug_assertions)]
+    {
+        let elapsed = start.elapsed().as_micros();
+        PERF_STATS.lock().unwrap().is_semantic_node_time += elapsed;
     }
+
+    result
 }
 
 fn extract_name(cursor: &tree_sitter::TreeCursor, source: &str) -> Option<String> {
+    #[cfg(debug_assertions)]
+    let start = Instant::now();
+    #[cfg(debug_assertions)]
+    {
+        PERF_STATS.lock().unwrap().extract_name_calls += 1;
+    }
+
     let node = cursor.node();
 
+    let extract_identifier = |n: tree_sitter::Node| -> Option<String> {
+        let kind = n.kind();
+        if kind == "identifier"
+            || kind == "property_identifier"
+            || kind == "type_identifier"
+            || kind == "name"
+        {
+            return Some(source[n.start_byte()..n.end_byte()].to_string());
+        }
+        None
+    };
+
     for i in 0..node.child_count() {
-        if let Some(child) = node.child(i) {
-            let kind = child.kind();
-            if kind == "identifier"
-                || kind == "property_identifier"
-                || kind == "type_identifier"
-                || kind == "name"
-            {
-                let start = child.start_byte();
-                let end = child.end_byte();
-                return Some(source[start..end].to_string());
+        if let Some(child) = node.child(i.try_into().unwrap()) {
+            if let Some(name) = extract_identifier(child) {
+                #[cfg(debug_assertions)]
+                {
+                    let elapsed = start.elapsed().as_micros();
+                    PERF_STATS.lock().unwrap().extract_name_time += elapsed;
+                }
+                return Some(name);
             }
         }
+    }
+
+    if node.kind() == "export_statement" {
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i.try_into().unwrap()) {
+                let child_kind = child.kind();
+                if matches!(
+                    child_kind,
+                    "function_declaration"
+                        | "class_declaration"
+                        | "interface_declaration"
+                        | "type_alias_declaration"
+                        | "enum_declaration"
+                        | "lexical_declaration"
+                        | "abstract_class_declaration"
+                ) {
+                    for j in 0..child.child_count() {
+                        if let Some(grandchild) = child.child(j.try_into().unwrap()) {
+                            if let Some(name) = extract_identifier(grandchild) {
+                                #[cfg(debug_assertions)]
+                                {
+                                    let elapsed = start.elapsed().as_micros();
+                                    PERF_STATS.lock().unwrap().extract_name_time += elapsed;
+                                }
+                                return Some(name);
+                            }
+                        }
+                    }
+
+                    if child_kind == "lexical_declaration" {
+                        for j in 0..child.child_count() {
+                            if let Some(declarator) = child.child(j.try_into().unwrap()) {
+                                if declarator.kind() == "variable_declarator" {
+                                    for k in 0..declarator.child_count() {
+                                        if let Some(name_node) =
+                                            declarator.child(k.try_into().unwrap())
+                                        {
+                                            if name_node.kind() == "identifier" {
+                                                #[cfg(debug_assertions)]
+                                                {
+                                                    let elapsed = start.elapsed().as_micros();
+                                                    PERF_STATS.lock().unwrap().extract_name_time +=
+                                                        elapsed;
+                                                }
+                                                return Some(
+                                                    source[name_node.start_byte()
+                                                        ..name_node.end_byte()]
+                                                        .to_string(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        let elapsed = start.elapsed().as_micros();
+        PERF_STATS.lock().unwrap().extract_name_time += elapsed;
     }
 
     None
@@ -396,24 +666,22 @@ fn merge_small_chunks(chunks: &mut Vec<CodeChunk>) {
     let mut current: Option<CodeChunk> = None;
 
     for chunk in chunks.drain(..) {
-        match current.take() {
-            None => {
-                current = Some(chunk);
-            }
-            Some(mut cur) => {
-                if cur.content.len() < MIN_CHUNK_SIZE * 2
-                    && cur.content.len() + chunk.content.len() <= MAX_CHUNK_SIZE
-                    && cur.end_line + 1 >= chunk.start_line
-                {
-                    cur.content.push_str("\n\n");
-                    cur.content.push_str(&chunk.content);
-                    cur.end_line = chunk.end_line;
-                    current = Some(cur);
-                } else {
-                    merged.push(cur);
-                    current = Some(chunk);
-                }
-            }
+        let Some(mut cur) = current.take() else {
+            current = Some(chunk);
+            continue;
+        };
+
+        if cur.content.len() < MIN_CHUNK_SIZE * 2
+            && cur.content.len() + chunk.content.len() <= MAX_CHUNK_SIZE
+            && cur.end_line + 1 >= chunk.start_line
+        {
+            cur.content.push_str("\n\n");
+            cur.content.push_str(&chunk.content);
+            cur.end_line = chunk.end_line;
+            current = Some(cur);
+        } else {
+            merged.push(cur);
+            current = Some(chunk);
         }
     }
 
@@ -445,7 +713,7 @@ fn chunk_by_lines(content: &str, language: &Language) -> Vec<CodeChunk> {
         let end = std::cmp::min(start + lines_per_chunk, total_lines);
         let sub_content: String = lines[start..end].join("\n");
 
-        if sub_content.len() >= MIN_CHUNK_SIZE {
+        if !sub_content.trim().is_empty() {
             chunks.push(CodeChunk {
                 content: sub_content,
                 start_line: start as u32 + 1,
@@ -478,11 +746,11 @@ function greet(name: string): string {
 
 class Greeter {
     private name: string;
-    
+
     constructor(name: string) {
         this.name = name;
     }
-    
+
     greet(): string {
         return `Hello, ${this.name}!`;
     }
@@ -502,7 +770,7 @@ def greet(name: str) -> str:
 class Greeter:
     def __init__(self, name: str):
         self.name = name
-    
+
     def greet(self) -> str:
         return f"Hello, {self.name}!"
 "#;
@@ -518,7 +786,7 @@ class Greeter:
             .collect();
         let content = lines.join("\n");
 
-        let chunks = chunk_by_lines(&content, &Language::Unknown);
+        let chunks = chunk_by_lines(&content, &Language::Text);
 
         assert!(chunks.len() >= 2, "Should have multiple chunks");
 
@@ -884,5 +1152,72 @@ Please read CONTRIBUTING.md for details.
         // Should be block type since we use line-based chunking
         let has_block = chunks.iter().any(|c| c.chunk_type == "block");
         assert!(has_block, "Markdown should use block chunking");
+    }
+
+    #[test]
+    fn test_parse_apex() {
+        let content = r#"
+public with sharing class AccountService {
+    public AccountService() {}
+
+    public static Account createAccount(String name) {
+        Account a = new Account(Name = name);
+        insert a;
+        return a;
+    }
+
+    public Integer countActive() {
+        return [SELECT COUNT() FROM Account WHERE Active__c = TRUE];
+    }
+}
+"#;
+
+        let chunks = parse_file_internal("AccountService.cls", content).unwrap();
+        assert!(!chunks.is_empty(), "Should have chunks for Apex");
+
+        let has_class = chunks.iter().any(|c| c.chunk_type == "class_declaration");
+        assert!(has_class, "Should find class_declaration");
+    }
+
+    #[test]
+    fn test_parse_apex_trigger() {
+        let content = r#"
+trigger AccountTrigger on Account (before insert, before update, after delete) {
+    for (Account a : Trigger.new) {
+        a.Description = 'Updated by trigger';
+    }
+}
+"#;
+
+        let chunks = parse_file_internal("AccountTrigger.trigger", content).unwrap();
+        assert!(!chunks.is_empty(), "Should have chunks for Apex trigger");
+
+        let has_trigger = chunks.iter().any(|c| c.chunk_type == "trigger_declaration");
+        assert!(has_trigger, "Should find trigger_declaration");
+    }
+
+    #[test]
+    fn test_apex_doc_comment_extraction() {
+        let content = r#"
+/**
+ * Service for managing Account records.
+ * Used by Aura controllers and batch jobs.
+ */
+public class AccountService {
+    public void doWork() {}
+}
+"#;
+
+        let chunks = parse_file_internal("AccountService.cls", content).unwrap();
+        let class_chunk = chunks.iter().find(|c| c.chunk_type == "class_declaration");
+        assert!(class_chunk.is_some(), "Should find class_declaration");
+        assert!(
+            class_chunk
+                .unwrap()
+                .content
+                .contains("Service for managing Account"),
+            "Class chunk should include leading block comment: {}",
+            class_chunk.unwrap().content
+        );
     }
 }

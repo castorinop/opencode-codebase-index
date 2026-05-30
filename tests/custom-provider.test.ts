@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createEmbeddingProvider, CustomProviderNonRetryableError } from "../src/embeddings/provider.js";
-import { createCustomProviderInfo } from "../src/embeddings/detector.js";
+import { createCustomProviderInfo, type ConfiguredProviderInfo } from "../src/embeddings/detector.js";
 import { Indexer } from "../src/indexer/index.js";
 import { parseConfig } from "../src/config/schema.js";
+import { EMBEDDING_MODELS } from "../src/config/constants.js";
 import pRetry from "p-retry";
 import * as fs from "fs";
 import * as os from "os";
@@ -10,6 +11,30 @@ import * as path from "path";
 
 describe("CustomEmbeddingProvider", () => {
   let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  function getCustomProviderInfo(
+    info: ConfiguredProviderInfo
+  ): Extract<ConfiguredProviderInfo, { provider: "custom" }> {
+    expect(info.provider).toBe("custom");
+    if (info.provider !== "custom") {
+      throw new Error("Expected custom provider info");
+    }
+    return info;
+  }
+
+  function getRejectedError<T>(promise: Promise<T>): Promise<Error> {
+    return promise.then<Error>(
+      () => {
+        throw new Error("Expected promise to reject");
+      },
+      (error: unknown) => {
+        if (error instanceof Error) {
+          return error;
+        }
+        return new Error(String(error));
+      }
+    );
+  }
 
   beforeEach(() => {
     fetchSpy = vi.spyOn(globalThis, "fetch");
@@ -92,6 +117,47 @@ describe("CustomEmbeddingProvider", () => {
 
     expect(result.embeddings).toHaveLength(3);
     expect(result.totalTokensUsed).toBe(30);
+  });
+
+  it("should split custom provider requests by maxBatchSize", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [
+          { embedding: new Array(768).fill(0.1) },
+          { embedding: new Array(768).fill(0.2) },
+        ],
+        usage: { total_tokens: 20 },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [
+          { embedding: new Array(768).fill(0.3) },
+          { embedding: new Array(768).fill(0.4) },
+        ],
+        usage: { total_tokens: 22 },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: [
+          { embedding: new Array(768).fill(0.5) },
+        ],
+        usage: { total_tokens: 11 },
+      }), { status: 200 }));
+
+    const info = createCustomProviderInfo({
+      baseUrl: "http://localhost:11434/v1",
+      model: "nomic-embed-text",
+      dimensions: 768,
+      maxBatchSize: 2,
+    });
+    const provider = createEmbeddingProvider(info);
+
+    const result = await provider.embedBatch(["text1", "text2", "text3", "text4", "text5"]);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    expect(JSON.parse((fetchSpy.mock.calls[0] as [string, RequestInit])[1].body as string).input).toEqual(["text1", "text2"]);
+    expect(JSON.parse((fetchSpy.mock.calls[1] as [string, RequestInit])[1].body as string).input).toEqual(["text3", "text4"]);
+    expect(JSON.parse((fetchSpy.mock.calls[2] as [string, RequestInit])[1].body as string).input).toEqual(["text5"]);
+    expect(result.embeddings).toHaveLength(5);
+    expect(result.totalTokensUsed).toBe(53);
   });
 
   it("should estimate tokens when usage is not provided", async () => {
@@ -213,28 +279,28 @@ describe("CustomEmbeddingProvider", () => {
   });
 
   it("should default timeout to 30000ms", () => {
-    const info = createCustomProviderInfo({
+    const info = getCustomProviderInfo(createCustomProviderInfo({
       baseUrl: "http://localhost:11434/v1",
       model: "nomic-embed-text",
       dimensions: 768,
-    });
+    }));
     expect(info.modelInfo.timeoutMs).toBe(30000);
   });
 
   it("should use custom timeout value from config", () => {
-    const info = createCustomProviderInfo({
+    const info = getCustomProviderInfo(createCustomProviderInfo({
       baseUrl: "http://localhost:11434/v1",
       model: "nomic-embed-text",
       dimensions: 768,
       timeoutMs: 60000,
-    });
+    }));
     expect(info.modelInfo.timeoutMs).toBe(60000);
   });
 
   it("should throw non-retryable error on 4xx responses (except 429)", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("Unauthorized", { status: 401 }));
     const provider = createProvider();
-    const error = await provider.embedQuery("test").catch((e: Error) => e);
+    const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).toBeInstanceOf(CustomProviderNonRetryableError);
     expect(error.message).toContain("non-retryable");
     expect(error.message).toContain("401");
@@ -243,21 +309,21 @@ describe("CustomEmbeddingProvider", () => {
   it("should throw non-retryable error on 400 Bad Request", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("Bad model name", { status: 400 }));
     const provider = createProvider();
-    const error = await provider.embedQuery("test").catch((e: Error) => e);
+    const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).toBeInstanceOf(CustomProviderNonRetryableError);
   });
 
   it("should throw non-retryable error on 403 Forbidden", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("Forbidden", { status: 403 }));
     const provider = createProvider();
-    const error = await provider.embedQuery("test").catch((e: Error) => e);
+    const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).toBeInstanceOf(CustomProviderNonRetryableError);
   });
 
   it("should throw retryable error on 429 rate limit", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("Rate limited", { status: 429 }));
     const provider = createProvider();
-    const error = await provider.embedQuery("test").catch((e: Error) => e);
+    const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).not.toBeInstanceOf(CustomProviderNonRetryableError);
     expect(error.message).toContain("429");
   });
@@ -265,7 +331,7 @@ describe("CustomEmbeddingProvider", () => {
   it("should throw retryable error on 5xx server errors", async () => {
     fetchSpy.mockResolvedValueOnce(new Response("Internal Server Error", { status: 500 }));
     const provider = createProvider();
-    const error = await provider.embedQuery("test").catch((e: Error) => e);
+    const error = await getRejectedError(provider.embedQuery("test"));
     expect(error).not.toBeInstanceOf(CustomProviderNonRetryableError);
     expect(error.message).toContain("500");
   });
@@ -367,6 +433,146 @@ describe("CustomEmbeddingProvider", () => {
 
     // Should have been called 3 times (1 initial + 2 retries)
     expect(attempts).toBe(3);
+  });
+});
+
+describe("OllamaEmbeddingProvider", () => {
+  let fetchSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    fetchSpy = vi.spyOn(globalThis, "fetch");
+  });
+
+  afterEach(() => {
+    fetchSpy.mockRestore();
+  });
+
+  function createOllamaProvider(model: keyof typeof EMBEDDING_MODELS.ollama = "nomic-embed-text") {
+    return createEmbeddingProvider({
+      provider: "ollama",
+      credentials: {
+        provider: "ollama",
+        baseUrl: "http://localhost:11434",
+      },
+      modelInfo: EMBEDDING_MODELS.ollama[model],
+    });
+  }
+
+  it("retries oversize prompts with truncation for ollama", async () => {
+    fetchSpy
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "the input length exceeds the context length" }), { status: 500 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ embedding: new Array(768).fill(0.1) }), { status: 200 }));
+
+    const provider = createOllamaProvider();
+    const oversized = "x".repeat(9000);
+    const result = await provider.embedBatch([oversized]);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse((fetchSpy.mock.calls[0] as [string, RequestInit])[1].body as string) as { prompt: string; truncate: boolean };
+    const secondBody = JSON.parse((fetchSpy.mock.calls[1] as [string, RequestInit])[1].body as string) as { prompt: string; truncate: boolean };
+    expect(firstBody.truncate).toBe(false);
+    expect(secondBody.truncate).toBe(false);
+    expect(secondBody.prompt.length).toBeLessThan(firstBody.prompt.length);
+    expect(result.embeddings).toHaveLength(1);
+  });
+
+  it("backs off on context errors even when the prompt is below the estimated char limit", async () => {
+    const prompts: string[] = [];
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { prompt?: string; truncate?: boolean };
+      prompts.push(body.prompt ?? "");
+
+      if (prompts.length === 1) {
+        return new Response(JSON.stringify({ error: "the input length exceeds the context length" }), { status: 500 });
+      }
+
+      return new Response(JSON.stringify({ embedding: new Array(768).fill(0.1) }), { status: 200 });
+    });
+
+    const provider = createOllamaProvider();
+    const nearLimit = "x".repeat(7000);
+    const result = await provider.embedBatch([nearLimit]);
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].length).toBeLessThan(prompts[0].length);
+    expect(result.embeddings).toHaveLength(1);
+  });
+
+  it("keeps shrinking ollama prompts until a context-length retry succeeds", async () => {
+    const prompts: string[] = [];
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { prompt?: string; truncate?: boolean };
+      prompts.push(body.prompt ?? "");
+
+      if (prompts.length < 3) {
+        return new Response(JSON.stringify({ error: "the input length exceeds the context length" }), { status: 500 });
+      }
+
+      return new Response(JSON.stringify({ embedding: new Array(768).fill(0.1) }), { status: 200 });
+    });
+
+    const provider = createOllamaProvider();
+    const oversized = "x".repeat(9000);
+    const result = await provider.embedBatch([oversized]);
+
+    expect(prompts).toHaveLength(3);
+    expect(prompts[1].length).toBeLessThan(prompts[0].length);
+    expect(prompts[2].length).toBeLessThan(prompts[1].length);
+    expect(result.embeddings).toHaveLength(1);
+  });
+
+  it("matches alternate Ollama context-length error wording", async () => {
+    const prompts: string[] = [];
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { prompt?: string; truncate?: boolean };
+      prompts.push(body.prompt ?? "");
+
+      if (prompts.length === 1) {
+        return new Response(JSON.stringify({ error: "Context length exceeded for this embedding request" }), { status: 500 });
+      }
+
+      return new Response(JSON.stringify({ embedding: new Array(768).fill(0.1) }), { status: 200 });
+    });
+
+    const provider = createOllamaProvider();
+    const oversized = "x".repeat(9000);
+    const result = await provider.embedBatch([oversized]);
+
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1].length).toBeLessThan(prompts[0].length);
+    expect(result.embeddings).toHaveLength(1);
+  });
+
+  it("processes ollama embedBatch requests sequentially", async () => {
+    let activeRequests = 0;
+    let maxActiveRequests = 0;
+
+    fetchSpy.mockImplementation(async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? "{}")) as { truncate?: boolean };
+      expect(body.truncate).toBe(false);
+
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
+
+      activeRequests -= 1;
+      return new Response(JSON.stringify({ embedding: new Array(768).fill(0.1) }), { status: 200 });
+    });
+
+    const provider = createOllamaProvider();
+    const result = await provider.embedBatch(["first", "second", "third"]);
+
+    expect(result.embeddings).toHaveLength(3);
+    expect(maxActiveRequests).toBe(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("rethrows non-context ollama errors", async () => {
+    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
+
+    const provider = createOllamaProvider();
+    await expect(provider.embedBatch(["hello"])).rejects.toThrow("Ollama embedding API error: 500");
   });
 });
 

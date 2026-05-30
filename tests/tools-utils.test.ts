@@ -24,6 +24,7 @@ function createBaseStats(overrides: Partial<IndexStats> = {}): IndexStats {
     removedChunks: 0,
     skippedFiles: [],
     parseFailures: [],
+    failedBatchesPath: undefined,
     ...overrides,
   };
 }
@@ -80,6 +81,36 @@ describe("tools utils", () => {
       const result = formatIndexStats(stats);
 
       expect(result).toContain("Failed: 2 chunks");
+    });
+
+    it("should highlight failed batch path when chunks fail", () => {
+      const stats = createBaseStats({
+        totalFiles: 10,
+        indexedChunks: 5,
+        failedChunks: 2,
+        failedBatchesPath: "/tmp/failed-batches.json",
+        tokensUsed: 500,
+        durationMs: 500,
+      });
+      const result = formatIndexStats(stats);
+
+      expect(result).toContain("INDEXING WARNING");
+      expect(result).toContain("/tmp/failed-batches.json");
+    });
+
+    it("should surface corrupted index reset guidance instead of a success summary", () => {
+      const stats = createBaseStats({
+        totalFiles: 10,
+        indexedChunks: 5,
+        removedChunks: 2,
+        resetCorruptedIndex: true,
+        warning: "Detected a corrupted local SQLite index and reset the local index. Run index_codebase to rebuild search data.",
+      });
+      const result = formatIndexStats(stats);
+
+      expect(result).toContain("corrupted local SQLite index");
+      expect(result).toContain("Run index_codebase to rebuild search data");
+      expect(result).not.toContain("5 new chunks embedded");
     });
 
     it("should not include verbose details by default", () => {
@@ -148,6 +179,8 @@ describe("tools utils", () => {
         currentBranch: "default",
         baseBranch: "default",
         compatibility: null,
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
       };
       const result = formatStatus(status);
 
@@ -165,6 +198,8 @@ describe("tools utils", () => {
         currentBranch: "default",
         baseBranch: "default",
         compatibility: { compatible: true },
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
       };
       const result = formatStatus(status);
 
@@ -186,6 +221,8 @@ describe("tools utils", () => {
         currentBranch: "feature-x",
         baseBranch: "main",
         compatibility: { compatible: true },
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
       };
       const result = formatStatus(status);
 
@@ -214,6 +251,8 @@ describe("tools utils", () => {
             updatedAt: "2025-01-01",
           },
         },
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
       };
       const result = formatStatus(status);
 
@@ -233,10 +272,71 @@ describe("tools utils", () => {
         currentBranch: "default",
         baseBranch: "default",
         compatibility: null,
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
       };
       const result = formatStatus(status);
 
       expect(result).toContain("No compatibility information found");
+    });
+
+    it("should surface failed batches when index is not yet usable", () => {
+      const status: StatusResult = {
+        indexed: false,
+        vectorCount: 0,
+        provider: "google",
+        model: "gemini-embedding-001",
+        indexPath: "/tmp/index",
+        currentBranch: "default",
+        baseBranch: "default",
+        compatibility: null,
+        failedBatchesCount: 2,
+        failedBatchesPath: "/tmp/index/failed-batches.json",
+      };
+      const result = formatStatus(status);
+
+      expect(result).toContain("failed embedding batches");
+      expect(result).toContain("/tmp/index/failed-batches.json");
+    });
+
+    it("should surface startup reset guidance before generic not-indexed messaging", () => {
+      const status: StatusResult = {
+        indexed: false,
+        vectorCount: 0,
+        provider: "google",
+        model: "gemini-embedding-001",
+        indexPath: "/tmp/index",
+        currentBranch: "default",
+        baseBranch: "default",
+        compatibility: null,
+        failedBatchesCount: 0,
+        failedBatchesPath: undefined,
+        warning: "Detected a corrupted local SQLite index at /tmp/index/codebase.db and reset the local index. Run index_codebase to rebuild search data.",
+      };
+      const result = formatStatus(status);
+
+      expect(result).toContain("corrupted local SQLite index");
+      expect(result).toContain("Run index_codebase to rebuild search data");
+      expect(result).not.toContain("Codebase is not indexed");
+    });
+
+    it("should warn when indexed data exists alongside failed batches", () => {
+      const status: StatusResult = {
+        indexed: true,
+        vectorCount: 100,
+        provider: "google",
+        model: "gemini-embedding-001",
+        indexPath: "/tmp/index",
+        currentBranch: "default",
+        baseBranch: "default",
+        compatibility: { compatible: true },
+        failedBatchesCount: 1,
+        failedBatchesPath: "/tmp/index/failed-batches.json",
+      };
+      const result = formatStatus(status);
+
+      expect(result).toContain("INDEXING WARNING");
+      expect(result).toContain("failed-batches.json");
     });
   });
 
@@ -315,7 +415,7 @@ describe("tools utils", () => {
 
   describe("formatCodebasePeek", () => {
     it("should return empty message for no results", () => {
-      const result = formatCodebasePeek([], "test query");
+      const result = formatCodebasePeek([]);
 
       expect(result).toContain("No matching code found");
     });
@@ -330,14 +430,12 @@ describe("tools utils", () => {
         chunkType: "function",
         name: "initialize",
       }];
-      const result = formatCodebasePeek(results, "init function");
+      const result = formatCodebasePeek(results);
 
-      expect(result).toContain("1 locations");
       expect(result).toContain('"initialize"');
       expect(result).toContain("src/index.ts:10-20");
       expect(result).toContain("0.85");
       expect(result).toContain("function");
-      expect(result).toContain("Use Read tool");
     });
 
     it("should format results without names as anonymous", () => {
@@ -349,7 +447,7 @@ describe("tools utils", () => {
         score: 0.70,
         chunkType: "other",
       }];
-      const result = formatCodebasePeek(results, "utils");
+      const result = formatCodebasePeek(results);
 
       expect(result).toContain("(anonymous)");
     });
@@ -364,13 +462,31 @@ describe("tools utils", () => {
         chunkType: "function",
         name: "foo",
       }];
-      const result = formatCodebasePeek(results, "my search query");
+      const result = formatCodebasePeek(results);
 
-      expect(result).toContain('"my search query"');
+      expect(result).toContain('"foo"');
+      expect(result).toContain("a.ts:1-2");
+      expect(result).toContain("0.5");
     });
   });
 
   describe("formatHealthCheck", () => {
+    it("should show corruption reset warning when health check reset the local index", () => {
+      const result = formatHealthCheck({
+        removed: 0,
+        filePaths: [],
+        gcOrphanEmbeddings: 0,
+        gcOrphanChunks: 0,
+        gcOrphanSymbols: 0,
+        gcOrphanCallEdges: 0,
+        resetCorruptedIndex: true,
+        warning: "Detected a corrupted local SQLite index and reset the local index.",
+      });
+
+      expect(result).toContain("corrupted local SQLite index");
+      expect(result).toContain("reset the local index");
+    });
+
     it("should return healthy message when nothing to clean", () => {
       const result = formatHealthCheck({
         removed: 0,

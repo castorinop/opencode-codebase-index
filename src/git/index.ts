@@ -1,6 +1,25 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "fs";
+import { existsSync, readFileSync, statSync } from "fs";
 import * as path from "path";
-import { execSync } from "child_process";
+import { collectBranchRefs, readPackedRefs, resolveCommonGitDir, tryResolveRefCommit } from "./refs.js";
+
+export function resolveWorktreeMainRepoRoot(repoRoot: string): string | null {
+  const gitDir = resolveGitDir(repoRoot);
+  if (!gitDir) {
+    return null;
+  }
+
+  const commonGitDir = resolveCommonGitDir(gitDir);
+  if (commonGitDir === gitDir || path.basename(commonGitDir) !== ".git") {
+    return null;
+  }
+
+  const mainRepoRoot = path.dirname(commonGitDir);
+  if (!existsSync(mainRepoRoot)) {
+    return null;
+  }
+
+  return path.resolve(mainRepoRoot) === path.resolve(repoRoot) ? null : mainRepoRoot;
+}
 
 /**
  * Resolves the actual git directory path.
@@ -21,12 +40,10 @@ export function resolveGitDir(repoRoot: string): string | null {
     const stat = statSync(gitPath);
     
     if (stat.isDirectory()) {
-      // Normal repo: .git is a directory
       return gitPath;
     }
     
     if (stat.isFile()) {
-      // Worktree: .git is a file with gitdir pointer
       const content = readFileSync(gitPath, "utf-8").trim();
       const match = content.match(/^gitdir:\s*(.+)$/);
       if (match) {
@@ -83,13 +100,30 @@ export function getCurrentBranch(repoRoot: string): string | null {
 }
 
 export function getCurrentCommit(repoRoot: string): string | null {
+  const gitDir = resolveGitDir(repoRoot);
+  if (!gitDir) {
+    return null;
+  }
+  const refStoreDir = resolveCommonGitDir(gitDir);
+
+  const headPath = path.join(gitDir, "HEAD");
+  if (!existsSync(headPath)) {
+    return null;
+  }
+
   try {
-    const result = execSync("git rev-parse HEAD", {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    return result.trim();
+    const headContent = readFileSync(headPath, "utf-8").trim();
+
+    if (/^[0-9a-f]{40}$/i.test(headContent)) {
+      return headContent;
+    }
+
+    const refMatch = headContent.match(/^ref:\s*(.+)$/);
+    if (!refMatch) {
+      return null;
+    }
+
+    return tryResolveRefCommit(refStoreDir, refMatch[1]);
   } catch {
     return null;
   }
@@ -97,109 +131,62 @@ export function getCurrentCommit(repoRoot: string): string | null {
 
 export function getBaseBranch(repoRoot: string): string {
   const gitDir = resolveGitDir(repoRoot);
+  const refStoreDir = gitDir ? resolveCommonGitDir(gitDir) : null;
   const candidates = ["main", "master", "develop", "trunk"];
   
-  if (gitDir) {
+  if (refStoreDir) {
     for (const candidate of candidates) {
-      const refPath = path.join(gitDir, "refs", "heads", candidate);
+      const refPath = path.join(refStoreDir, "refs", "heads", candidate);
       if (existsSync(refPath)) {
         return candidate;
       }
-      
-      const packedRefsPath = path.join(gitDir, "packed-refs");
-      if (existsSync(packedRefsPath)) {
-        try {
-          const content = readFileSync(packedRefsPath, "utf-8");
-          if (content.includes(`refs/heads/${candidate}`)) {
-            return candidate;
-          }
-        } catch {
-          // Ignore
-        }
+
+      const packedRefs = readPackedRefs(refStoreDir);
+      if (packedRefs.some((line) => line.endsWith(` refs/heads/${candidate}`))) {
+        return candidate;
       }
     }
-  }
-
-  try {
-    const result = execSync("git remote show origin", {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    const match = result.match(/HEAD branch: (.+)/);
-    if (match) {
-      return match[1].trim();
-    }
-  } catch {
-    // Ignore - remote might not exist
   }
 
   return getCurrentBranch(repoRoot) ?? "main";
 }
 
 export function getAllBranches(repoRoot: string): string[] {
-  const branches: string[] = [];
+  const branchSet = new Set<string>();
   const gitDir = resolveGitDir(repoRoot);
+  const refStoreDir = gitDir ? resolveCommonGitDir(gitDir) : null;
   
-  if (!gitDir) {
-    return branches;
-  }
-  
-  const refsPath = path.join(gitDir, "refs", "heads");
-  
-  if (!existsSync(refsPath)) {
-    return branches;
-  }
-
-  try {
-    const result = execSync("git branch --list", {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    
-    for (const line of result.split("\n")) {
-      const branch = line.replace(/^\*?\s+/, "").trim();
-      if (branch) {
-        branches.push(branch);
-      }
-    }
-  } catch {
-    try {
-      const entries = readdirSync(refsPath);
-      for (const entry of entries) {
-        const stat = statSync(path.join(refsPath, entry));
-        if (stat.isFile()) {
-          branches.push(entry);
-        }
-      }
-    } catch {
-      // Ignore
-    }
-  }
-
-  return branches;
-}
-
-export function getChangedFiles(
-  repoRoot: string,
-  fromCommit: string,
-  toCommit: string = "HEAD"
-): string[] {
-  try {
-    const result = execSync(`git diff --name-only ${fromCommit} ${toCommit}`, {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    
-    return result
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-  } catch {
+  if (!refStoreDir) {
     return [];
   }
+  
+  const refsPath = path.join(refStoreDir, "refs", "heads");
+  
+  if (!existsSync(refsPath)) {
+    return [];
+  }
+
+  const looseBranches: string[] = [];
+  collectBranchRefs(looseBranches, refsPath);
+  for (const branch of looseBranches) {
+    branchSet.add(branch);
+  }
+
+  const packedRefs = readPackedRefs(refStoreDir);
+  for (const line of packedRefs) {
+    const splitIndex = line.indexOf(" ");
+    if (splitIndex <= 0) {
+      continue;
+    }
+
+    const ref = line.slice(splitIndex + 1).trim();
+    const prefix = "refs/heads/";
+    if (ref.startsWith(prefix)) {
+      branchSet.add(ref.slice(prefix.length));
+    }
+  }
+
+  return Array.from(branchSet).sort();
 }
 
 export function getBranchOrDefault(repoRoot: string): string {

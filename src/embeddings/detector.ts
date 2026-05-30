@@ -1,4 +1,4 @@
-import { type EmbeddingProvider, type CustomProviderConfig, type BaseModelInfo, getDefaultModelForProvider, isValidModel, availableProviders, EmbeddingModelName, EMBEDDING_MODELS } from "../config";
+import { type EmbeddingProvider, type CustomProviderConfig, type BaseModelInfo, getDefaultModelForProvider, isValidModel, autoDetectProviders, EmbeddingModelName, EMBEDDING_MODELS } from "../config";
 import { existsSync, readFileSync } from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -15,6 +15,7 @@ export interface ProviderCredentials {
 export interface CustomModelInfo extends BaseModelInfo {
   provider: 'custom';
   timeoutMs: number;
+  maxBatchSize?: number;
 }
 
 export type ConfiguredProviderInfo = {
@@ -90,7 +91,7 @@ export async function detectEmbeddingProvider<P extends EmbeddingProvider>(
 }
 
 export async function tryDetectProvider(): Promise<ConfiguredProviderInfo> {
-  for (const provider of availableProviders) {
+  for (const provider of autoDetectProviders) {
     const credentials = await getProviderCredentials(provider);
     if (credentials) {
       return {
@@ -102,7 +103,7 @@ export async function tryDetectProvider(): Promise<ConfiguredProviderInfo> {
   }
 
   throw new Error(
-    `No embedding-capable provider found. Please authenticate with OpenCode using one of: ${availableProviders.join(", ")}.`
+    `No embedding-capable provider found. Please authenticate with OpenCode using one of: ${autoDetectProviders.join(", ")}.`
   );
 }
 
@@ -133,8 +134,9 @@ function getGitHubCopilotCredentials(): ProviderCredentials | null {
 
   // Use GitHub Models API for embeddings (models.github.ai)
   // Enterprise uses different URL pattern
-  const baseUrl = (copilotAuth as OpenCodeAuthOAuth).enterpriseUrl
-    ? `https://copilot-api.${(copilotAuth as OpenCodeAuthOAuth).enterpriseUrl!.replace(/^https?:\/\//, "").replace(/\/$/, "")}`
+  const auth = copilotAuth as OpenCodeAuthOAuth;
+  const baseUrl = auth.enterpriseUrl
+    ? `https://copilot-api.${auth.enterpriseUrl.replace(/^https?:\/\//, "").replace(/\/$/, "")}`
     : "https://models.github.ai";
 
   return {
@@ -247,6 +249,7 @@ export function createCustomProviderInfo(config: CustomProviderConfig): Configur
       maxTokens: config.maxTokens ?? 8192,
       costPer1MTokens: 0,
       timeoutMs: config.timeoutMs ?? 30_000,
+      maxBatchSize: config.maxBatchSize,
     },
   };
 }

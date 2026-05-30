@@ -1,5 +1,6 @@
 import * as path from "path";
 import * as os from "os";
+import * as module from "module";
 import { fileURLToPath } from "url";
 
 function getNativeBinding() {
@@ -44,35 +45,70 @@ function getNativeBinding() {
 
   // Determine the current directory - handle ESM, CJS, and bundled contexts
   let currentDir: string;
+  let requireTarget: string;
   
   // Check for ESM context with valid import.meta.url
   if (typeof import.meta !== 'undefined' && import.meta.url) {
     currentDir = path.dirname(fileURLToPath(import.meta.url));
+    requireTarget = import.meta.url;
   } 
   // Fallback to __dirname for CJS/bundled contexts
   else if (typeof __dirname !== 'undefined') {
     currentDir = __dirname;
+    requireTarget = __filename;
   }
   // Last resort: use process.cwd() - shouldn't normally hit this
   else {
     currentDir = process.cwd();
+    requireTarget = path.join(currentDir, "index.js");
   }
   
   // The native module is in the 'native' folder at package root
   // From dist/index.js, we go up one level to package root, then into native/
   // From src/native/index.ts (dev/test), we go up two levels to package root
-  const isDevMode = currentDir.includes('/src/native');
-  const packageRoot = isDevMode 
-    ? path.resolve(currentDir, '../..') 
+  const normalizedDir = currentDir.replace(/\\/g, '/');
+  const isDevMode = normalizedDir.includes('/src/native') || currentDir.includes(path.join('src', 'native'));
+  const packageRoot = isDevMode
+    ? path.resolve(currentDir, '../..')
     : path.resolve(currentDir, '..');
   const nativePath = path.join(packageRoot, 'native', bindingName);
   
   // Load the native module - use standard require for .node files
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const require = module.createRequire(requireTarget);
   return require(nativePath);
 }
 
-const native = getNativeBinding();
+function createMockNativeBinding() {
+  const error = new Error("Native module not available. Please rebuild with 'npm run build:native'.");
+  
+  return {
+    parseFile: () => { throw error; },
+    parseFiles: () => { throw error; },
+    hashContent: () => { throw error; },
+    hashFile: () => { throw error; },
+    extractCalls: () => { throw error; },
+    VectorStore: class {
+      constructor() { throw error; }
+    },
+    InvertedIndex: class {
+      constructor() { throw error; }
+      serialize() { throw error; }
+      deserialize() { throw error; }
+    },
+    Database: class {
+      constructor() { throw error; }
+      close() { throw error; }
+    },
+  };
+}
+
+let native: any;
+try {
+  native = getNativeBinding();
+} catch (e) {
+  console.error("[codebase-index] Failed to load native module:", e);
+  native = createMockNativeBinding();
+}
 
 export interface FileInput {
   path: string;
@@ -163,6 +199,11 @@ export interface ChunkMetadata {
 
 export function parseFile(filePath: string, content: string): CodeChunk[] {
   const result = native.parseFile(filePath, content);
+  return result.map(mapChunk);
+}
+
+export function parseFileAsText(filePath: string, content: string): CodeChunk[] {
+  const result = native.parseFileAsText(filePath, content);
   return result.map(mapChunk);
 }
 
@@ -304,27 +345,27 @@ export class VectorStore {
 // Token estimation: ~4 chars per token for code (conservative)
 const CHARS_PER_TOKEN = 4;
 const MAX_BATCH_TOKENS = 7500; // Leave buffer under 8192 API limit
-const MAX_SINGLE_CHUNK_TOKENS = 2000; // Truncate individual chunks beyond this
+const MAX_SINGLE_CHUNK_TOKENS = 2000; // Default truncation cap for individual chunks
 
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / CHARS_PER_TOKEN);
 }
 
-export function createEmbeddingText(chunk: CodeChunk, filePath: string): string {
+function getEmbeddingHeaderParts(chunk: CodeChunk, filePath: string): string[] {
   const parts: string[] = [];
-  
+
   const fileName = filePath.split("/").pop() || filePath;
   const dirPath = filePath.split("/").slice(-3, -1).join("/");
-  
+
   const langDescriptors: Record<string, string> = {
     typescript: "TypeScript",
-    javascript: "JavaScript", 
+    javascript: "JavaScript",
     python: "Python",
     rust: "Rust",
     go: "Go",
     java: "Java",
   };
-  
+
   const typeDescriptors: Record<string, string> = {
     function_declaration: "function",
     function: "function",
@@ -347,48 +388,103 @@ export function createEmbeddingText(chunk: CodeChunk, filePath: string): string 
 
   const lang = langDescriptors[chunk.language] || chunk.language;
   const typeDesc = typeDescriptors[chunk.chunkType] || chunk.chunkType;
-  
+
   if (chunk.name) {
     parts.push(`${lang} ${typeDesc} "${chunk.name}"`);
   } else {
     parts.push(`${lang} ${typeDesc}`);
   }
-  
+
   if (dirPath) {
     parts.push(`in ${dirPath}/${fileName}`);
   } else {
     parts.push(`in ${fileName}`);
   }
-  
+
   const semanticHints = extractSemanticHints(chunk.name || "", chunk.content);
   if (semanticHints.length > 0) {
     parts.push(`Purpose: ${semanticHints.join(", ")}`);
   }
-  
-  parts.push("");
-  
-  let content = chunk.content;
-  const headerLength = parts.join("\n").length;
-  const maxContentChars = (MAX_SINGLE_CHUNK_TOKENS * CHARS_PER_TOKEN) - headerLength;
-  
-  if (content.length > maxContentChars) {
-    content = content.slice(0, maxContentChars) + "\n... [truncated]";
-  }
-  
-  parts.push(content);
 
+  return parts;
+}
+
+function buildEmbeddingText(headerParts: string[], content: string, partIndex?: number, partCount?: number): string {
+  const parts = [...headerParts];
+  if (partCount && partCount > 1 && partIndex) {
+    parts.push(`Part ${partIndex}/${partCount}`);
+  }
+  parts.push("");
+  parts.push(content);
   return parts.join("\n");
 }
 
-export function createDynamicBatches<T extends { text: string }>(chunks: T[]): T[][] {
+function splitOversizedContent(content: string, maxContentChars: number): string[] {
+  if (content.length <= maxContentChars) {
+    return [content];
+  }
+
+  const overlapChars = Math.max(CHARS_PER_TOKEN * 32, Math.min(Math.floor(maxContentChars * 0.15), CHARS_PER_TOKEN * 128));
+  const stepChars = Math.max(1, maxContentChars - overlapChars);
+  const segments: string[] = [];
+
+  for (let start = 0; start < content.length; start += stepChars) {
+    const end = Math.min(content.length, start + maxContentChars);
+    segments.push(content.slice(start, end));
+    if (end >= content.length) {
+      break;
+    }
+  }
+
+  return segments;
+}
+
+export function createEmbeddingTexts(chunk: CodeChunk, filePath: string, maxChunkTokens = MAX_SINGLE_CHUNK_TOKENS): string[] {
+  const headerParts = getEmbeddingHeaderParts(chunk, filePath);
+  const headerLength = buildEmbeddingText(headerParts, "", 1, 9).length;
+  const maxContentChars = Math.max(1, (maxChunkTokens * CHARS_PER_TOKEN) - headerLength);
+  const segments = splitOversizedContent(chunk.content, maxContentChars);
+
+  if (segments.length === 1) {
+    return [buildEmbeddingText(headerParts, segments[0])];
+  }
+
+  return segments.map((segment, index) => buildEmbeddingText(headerParts, segment, index + 1, segments.length));
+}
+
+export function createEmbeddingText(chunk: CodeChunk, filePath: string, maxChunkTokens = MAX_SINGLE_CHUNK_TOKENS): string {
+  const text = createEmbeddingTexts(chunk, filePath, maxChunkTokens)[0];
+  if (!text) {
+    return "";
+  }
+
+  const maxChars = maxChunkTokens * CHARS_PER_TOKEN;
+  if (text.length <= maxChars) {
+    return text;
+  }
+
+  return text.slice(0, Math.max(0, maxChars - 17)) + "\n... [truncated]";
+}
+
+export interface DynamicBatchOptions {
+  maxBatchTokens?: number;
+  maxBatchItems?: number;
+}
+
+export function createDynamicBatches<T extends { text: string; tokenCount?: number }>(chunks: T[], options: DynamicBatchOptions = {}): T[][] {
   const batches: T[][] = [];
   let currentBatch: T[] = [];
   let currentTokens = 0;
+  const maxBatchTokens = Math.max(1, options.maxBatchTokens ?? MAX_BATCH_TOKENS);
+  const maxBatchItems = Math.max(1, options.maxBatchItems ?? Number.MAX_SAFE_INTEGER);
   
   for (const chunk of chunks) {
-    const chunkTokens = estimateTokens(chunk.text);
-    
-    if (currentBatch.length > 0 && currentTokens + chunkTokens > MAX_BATCH_TOKENS) {
+    const chunkTokens = chunk.tokenCount ?? estimateTokens(chunk.text);
+
+    if (
+      currentBatch.length > 0
+      && (currentTokens + chunkTokens > maxBatchTokens || currentBatch.length >= maxBatchItems)
+    ) {
       batches.push(currentBatch);
       currentBatch = [];
       currentTokens = 0;
@@ -542,6 +638,14 @@ export class InvertedIndex {
     this.inner.save();
   }
 
+  serialize(): string {
+    return this.inner.serialize();
+  }
+
+  deserialize(json: string): void {
+    this.inner.deserialize(json);
+  }
+
   addChunk(chunkId: string, content: string): void {
     this.inner.addChunk(chunkId, content);
   }
@@ -599,16 +703,37 @@ export interface DatabaseStats {
 
 export class Database {
   private inner: any;
+  private closed = false;
 
   constructor(dbPath: string) {
     this.inner = new native.Database(dbPath);
   }
 
+  private throwIfClosed(): void {
+    if (this.closed) {
+      throw new Error("Database is closed");
+    }
+  }
+
+  close(): void {
+    if (this.closed) {
+      return;
+    }
+
+    if (typeof this.inner.close === "function") {
+      this.inner.close();
+    }
+
+    this.closed = true;
+  }
+
   embeddingExists(contentHash: string): boolean {
+    this.throwIfClosed();
     return this.inner.embeddingExists(contentHash);
   }
 
   getEmbedding(contentHash: string): Buffer | null {
+    this.throwIfClosed();
     return this.inner.getEmbedding(contentHash) ?? null;
   }
 
@@ -618,6 +743,7 @@ export class Database {
     chunkText: string,
     model: string
   ): void {
+    this.throwIfClosed();
     this.inner.upsertEmbedding(contentHash, embedding, chunkText, model);
   }
 
@@ -629,168 +755,279 @@ export class Database {
       model: string;
     }>
   ): void {
+    this.throwIfClosed();
     if (items.length === 0) return;
     this.inner.upsertEmbeddingsBatch(items);
   }
 
   getMissingEmbeddings(contentHashes: string[]): string[] {
+    this.throwIfClosed();
     return this.inner.getMissingEmbeddings(contentHashes);
   }
 
   upsertChunk(chunk: ChunkData): void {
+    this.throwIfClosed();
     this.inner.upsertChunk(chunk);
   }
 
   upsertChunksBatch(chunks: ChunkData[]): void {
+    this.throwIfClosed();
     if (chunks.length === 0) return;
     this.inner.upsertChunksBatch(chunks);
   }
 
   getChunk(chunkId: string): ChunkData | null {
+    this.throwIfClosed();
     return this.inner.getChunk(chunkId) ?? null;
   }
 
   getChunksByFile(filePath: string): ChunkData[] {
+    this.throwIfClosed();
     return this.inner.getChunksByFile(filePath);
   }
 
+  getChunksByName(name: string): ChunkData[] {
+    this.throwIfClosed();
+    return this.inner.getChunksByName(name);
+  }
+
+  getChunksByNameCi(name: string): ChunkData[] {
+    this.throwIfClosed();
+    return this.inner.getChunksByNameCi(name);
+  }
+
   deleteChunksByFile(filePath: string): number {
+    this.throwIfClosed();
     return this.inner.deleteChunksByFile(filePath);
   }
 
+  deleteChunksByIds(chunkIds: string[]): number {
+    this.throwIfClosed();
+    if (chunkIds.length === 0) return 0;
+    return this.inner.deleteChunksByIds(chunkIds);
+  }
+
   addChunksToBranch(branch: string, chunkIds: string[]): void {
+    this.throwIfClosed();
     this.inner.addChunksToBranch(branch, chunkIds);
   }
 
   addChunksToBranchBatch(branch: string, chunkIds: string[]): void {
+    this.throwIfClosed();
     if (chunkIds.length === 0) return;
     this.inner.addChunksToBranchBatch(branch, chunkIds);
   }
 
   clearBranch(branch: string): number {
+    this.throwIfClosed();
     return this.inner.clearBranch(branch);
   }
 
+  deleteBranchChunksByChunkIds(chunkIds: string[]): number {
+    this.throwIfClosed();
+    if (chunkIds.length === 0) return 0;
+    return this.inner.deleteBranchChunksByChunkIds(chunkIds);
+  }
+
+  deleteBranchChunksForBranch(branch: string, chunkIds: string[]): number {
+    this.throwIfClosed();
+    if (chunkIds.length === 0) return 0;
+    return this.inner.deleteBranchChunksForBranch(branch, chunkIds);
+  }
+
   getBranchChunkIds(branch: string): string[] {
+    this.throwIfClosed();
     return this.inner.getBranchChunkIds(branch);
   }
 
   getBranchDelta(branch: string, baseBranch: string): BranchDelta {
+    this.throwIfClosed();
     return this.inner.getBranchDelta(branch, baseBranch);
   }
 
+  getReferencedChunkIds(chunkIds: string[]): string[] {
+    this.throwIfClosed();
+    if (chunkIds.length === 0) return [];
+    return this.inner.getReferencedChunkIds(chunkIds);
+  }
+
   chunkExistsOnBranch(branch: string, chunkId: string): boolean {
+    this.throwIfClosed();
     return this.inner.chunkExistsOnBranch(branch, chunkId);
   }
 
   getAllBranches(): string[] {
+    this.throwIfClosed();
     return this.inner.getAllBranches();
   }
 
   getMetadata(key: string): string | null {
+    this.throwIfClosed();
     return this.inner.getMetadata(key) ?? null;
   }
 
   setMetadata(key: string, value: string): void {
+    this.throwIfClosed();
     this.inner.setMetadata(key, value);
   }
 
   deleteMetadata(key: string): boolean {
+    this.throwIfClosed();
     return this.inner.deleteMetadata(key);
   }
 
+  clearAllIndexedData(): void {
+    this.throwIfClosed();
+    this.inner.clearAllIndexedData();
+  }
+
+  clearCallEdgeTargetsForSymbols(symbolIds: string[]): number {
+    this.throwIfClosed();
+    if (symbolIds.length === 0) return 0;
+    return this.inner.clearCallEdgeTargetsForSymbols(symbolIds);
+  }
+
   gcOrphanEmbeddings(): number {
+    this.throwIfClosed();
     return this.inner.gcOrphanEmbeddings();
   }
 
   gcOrphanChunks(): number {
+    this.throwIfClosed();
     return this.inner.gcOrphanChunks();
   }
 
   getStats(): DatabaseStats {
+    this.throwIfClosed();
     return this.inner.getStats();
   }
 
-  // ── Symbol methods ──────────────────────────────────────────────
+
 
   upsertSymbol(symbol: SymbolData): void {
+    this.throwIfClosed();
     this.inner.upsertSymbol(symbol);
   }
 
   upsertSymbolsBatch(symbols: SymbolData[]): void {
+    this.throwIfClosed();
     if (symbols.length === 0) return;
     this.inner.upsertSymbolsBatch(symbols);
   }
 
   getSymbolsByFile(filePath: string): SymbolData[] {
+    this.throwIfClosed();
     return this.inner.getSymbolsByFile(filePath);
   }
 
   getSymbolByName(name: string, filePath: string): SymbolData | null {
+    this.throwIfClosed();
     return this.inner.getSymbolByName(name, filePath) ?? null;
   }
 
+  getSymbolsByName(name: string): SymbolData[] {
+    this.throwIfClosed();
+    return this.inner.getSymbolsByName(name);
+  }
+
+  getSymbolsByNameCi(name: string): SymbolData[] {
+    this.throwIfClosed();
+    return this.inner.getSymbolsByNameCi(name);
+  }
+
   deleteSymbolsByFile(filePath: string): number {
+    this.throwIfClosed();
     return this.inner.deleteSymbolsByFile(filePath);
   }
 
-  // ── Call Edge methods ────────────────────────────────────────────
+
 
   upsertCallEdge(edge: CallEdgeData): void {
+    this.throwIfClosed();
     this.inner.upsertCallEdge(edge);
   }
 
   upsertCallEdgesBatch(edges: CallEdgeData[]): void {
+    this.throwIfClosed();
     if (edges.length === 0) return;
     this.inner.upsertCallEdgesBatch(edges);
   }
 
   getCallers(targetName: string, branch: string): CallEdgeData[] {
+    this.throwIfClosed();
     return this.inner.getCallers(targetName, branch);
   }
 
   getCallersWithContext(targetName: string, branch: string): CallEdgeData[] {
+    this.throwIfClosed();
     return this.inner.getCallersWithContext(targetName, branch);
   }
 
   getCallees(symbolId: string, branch: string): CallEdgeData[] {
+    this.throwIfClosed();
     return this.inner.getCallees(symbolId, branch);
   }
 
   deleteCallEdgesByFile(filePath: string): number {
+    this.throwIfClosed();
     return this.inner.deleteCallEdgesByFile(filePath);
   }
 
   resolveCallEdge(edgeId: string, toSymbolId: string): void {
+    this.throwIfClosed();
     this.inner.resolveCallEdge(edgeId, toSymbolId);
   }
 
-  // ── Branch Symbol methods ────────────────────────────────────────
+
 
   addSymbolsToBranch(branch: string, symbolIds: string[]): void {
+    this.throwIfClosed();
     this.inner.addSymbolsToBranch(branch, symbolIds);
   }
 
   addSymbolsToBranchBatch(branch: string, symbolIds: string[]): void {
+    this.throwIfClosed();
     if (symbolIds.length === 0) return;
     this.inner.addSymbolsToBranchBatch(branch, symbolIds);
   }
 
   getBranchSymbolIds(branch: string): string[] {
+    this.throwIfClosed();
     return this.inner.getBranchSymbolIds(branch);
   }
 
   clearBranchSymbols(branch: string): number {
+    this.throwIfClosed();
     return this.inner.clearBranchSymbols(branch);
   }
 
-  // ── GC methods for symbols/edges ─────────────────────────────────
+  getReferencedSymbolIds(symbolIds: string[]): string[] {
+    this.throwIfClosed();
+    if (symbolIds.length === 0) return [];
+    return this.inner.getReferencedSymbolIds(symbolIds);
+  }
+
+  deleteBranchSymbolsBySymbolIds(symbolIds: string[]): number {
+    this.throwIfClosed();
+    if (symbolIds.length === 0) return 0;
+    return this.inner.deleteBranchSymbolsBySymbolIds(symbolIds);
+  }
+
+  deleteBranchSymbolsForBranch(branch: string, symbolIds: string[]): number {
+    this.throwIfClosed();
+    if (symbolIds.length === 0) return 0;
+    return this.inner.deleteBranchSymbolsForBranch(branch, symbolIds);
+  }
+
+
 
   gcOrphanSymbols(): number {
+    this.throwIfClosed();
     return this.inner.gcOrphanSymbols();
   }
 
   gcOrphanCallEdges(): number {
+    this.throwIfClosed();
     return this.inner.gcOrphanCallEdges();
   }
 }

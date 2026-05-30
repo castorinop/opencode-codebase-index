@@ -1,7 +1,7 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin";
 
+import { parseConfig, type ParsedCodebaseIndexConfig } from "../config/schema.js";
 import { Indexer } from "../indexer/index.js";
-import { ParsedCodebaseIndexConfig } from "../config/schema.js";
 import { formatCostEstimate } from "../utils/cost.js";
 import type { LogLevel } from "../config/schema.js";
 import type { LogEntry } from "../utils/logger.js";
@@ -11,17 +11,63 @@ import {
   formatStatus,
   calculatePercentage,
   formatCodebasePeek,
+  formatDefinitionLookup,
   formatHealthCheck,
   formatLogs,
   formatSearchResults,
 } from "./utils.js";
+import {
+  findKnowledgeBasePathIndex,
+  hasMatchingKnowledgeBasePath,
+  resolveKnowledgeBasePath,
+} from "./knowledge-base-paths.js";
+import { existsSync, realpathSync, statSync } from "fs";
+import * as path from "path";
+import { loadProjectConfigLayer, materializeLocalProjectConfig } from "../config/merger.js";
+import { resolveWorktreeMainRepoRoot } from "../git/index.js";
+import { getConfigPath, loadEditableConfig, loadRuntimeConfig, saveConfig } from "./config-state.js";
+import * as os from "os";
+
+function ensureStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? (value as string[]) : [];
+}
 
 const z = tool.schema;
 
 let sharedIndexer: Indexer | null = null;
+let sharedProjectRoot: string = "";
 
 export function initializeTools(projectRoot: string, config: ParsedCodebaseIndexConfig): void {
+  sharedProjectRoot = projectRoot;
   sharedIndexer = new Indexer(projectRoot, config);
+}
+
+export function getSharedIndexer(): Indexer {
+  return getIndexer();
+}
+
+function refreshIndexerFromConfig(): void {
+  if (!sharedProjectRoot) {
+    throw new Error("Codebase index tools not initialized. Plugin may not be loaded correctly.");
+  }
+
+  sharedIndexer = new Indexer(sharedProjectRoot, parseConfig(loadRuntimeConfig(sharedProjectRoot)));
+}
+
+function shouldForceLocalizeProjectIndex(): boolean {
+  const currentConfig = parseConfig(loadRuntimeConfig(sharedProjectRoot));
+  if (currentConfig.scope !== "project") {
+    return false;
+  }
+
+  const localIndexPath = path.join(sharedProjectRoot, ".opencode", "index");
+  const mainRepoRoot = resolveWorktreeMainRepoRoot(sharedProjectRoot);
+  if (!mainRepoRoot) {
+    return false;
+  }
+
+  const inheritedIndexPath = path.join(mainRepoRoot, ".opencode", "index");
+  return !existsSync(localIndexPath) && existsSync(inheritedIndexPath);
 }
 
 function getIndexer(): Indexer {
@@ -50,7 +96,7 @@ export const codebase_peek: ToolDefinition = tool({
       metadataOnly: true,
     });
 
-    return formatCodebasePeek(results, args.query);
+    return formatCodebasePeek(results);
   },
 });
 
@@ -63,7 +109,7 @@ export const index_codebase: ToolDefinition = tool({
     verbose: z.boolean().optional().default(false).describe("Show detailed info about skipped files and parsing failures"),
   },
   async execute(args, context) {
-    const indexer = getIndexer();
+    let indexer = getIndexer();
 
     // Guard: use noop if context is not provided
     const safeContext = context || { metadata: () => {} };
@@ -74,6 +120,11 @@ export const index_codebase: ToolDefinition = tool({
     }
 
     if (args.force) {
+      if (shouldForceLocalizeProjectIndex()) {
+        materializeLocalProjectConfig(sharedProjectRoot, loadProjectConfigLayer(sharedProjectRoot));
+        refreshIndexerFromConfig();
+        indexer = getIndexer();
+      }
       await indexer.clearIndex();
     }
 
@@ -190,7 +241,7 @@ export const find_similar: ToolDefinition = tool({
       return "No similar code found. Try a different snippet or run index_codebase first.";
     }
 
-    return `Found ${results.length} similar code blocks:\n\n${formatSearchResults(results)}`;
+    return formatSearchResults(results);
   },
 });
 
@@ -218,7 +269,30 @@ export const codebase_search: ToolDefinition = tool({
       return "No matching code found. Try a different query or run index_codebase first.";
     }
 
-    return `Found ${results.length} results for "${args.query}":\n\n${formatSearchResults(results, "score")}`;
+    return formatSearchResults(results, "score");
+  },
+});
+
+export const implementation_lookup: ToolDefinition = tool({
+  description:
+    "Jump to symbol definition. Find WHERE something is defined. " +
+    "Returns the authoritative source location(s) for a function, class, method, type, or variable. " +
+    "Prefers real implementation files over tests, docs, examples, and fixtures. " +
+    "Use when you need the definition site, not all usages.",
+  args: {
+    query: z.string().describe("Symbol name or natural language description (e.g., 'validateToken', 'where is the payment handler defined')"),
+    limit: z.number().optional().default(5).describe("Maximum number of results"),
+    fileType: z.string().optional().describe("Filter by file extension (e.g., 'ts', 'py')"),
+    directory: z.string().optional().describe("Filter by directory path (e.g., 'src/utils')"),
+  },
+  async execute(args) {
+    const indexer = getIndexer();
+    const results = await indexer.search(args.query, args.limit ?? 5, {
+      fileType: args.fileType,
+      directory: args.directory,
+      definitionIntent: true,
+    });
+    return formatDefinitionLookup(results, args.query);
   },
 });
 
@@ -243,7 +317,7 @@ export const call_graph: ToolDefinition = tool({
       const formatted = callees.map((e, i) =>
         `[${i + 1}] \u2192 ${e.targetName} (${e.callType}) at line ${e.line}${e.isResolved ? ` [resolved: ${e.toSymbolId}]` : " [unresolved]"}`
       );
-      return `${args.name} calls ${callees.length} function(s):\n\n${formatted.join("\n")}`;
+      return formatted.join("\n");
     }
     const callers = await indexer.getCallers(args.name);
     if (callers.length === 0) {
@@ -252,6 +326,171 @@ export const call_graph: ToolDefinition = tool({
     const formatted = callers.map((e, i) =>
       `[${i + 1}] \u2190 from ${e.fromSymbolName ?? "<unknown>"} in ${e.fromSymbolFilePath ?? "<unknown file>"} [${e.fromSymbolId}] (${e.callType}) at line ${e.line}${e.isResolved ? " [resolved]" : " [unresolved]"}`
     );
-    return `"${args.name}" is called by ${callers.length} function(s):\n\n${formatted.join("\n")}`;
+    return formatted.join("\n");
+  },
+});
+
+export const add_knowledge_base: ToolDefinition = tool({
+  description:
+    "Add a folder as a knowledge base to the semantic search index. " +
+    "The folder will be indexed alongside the main project code. " +
+    "Supports absolute paths or relative paths (relative to the project root).",
+  args: {
+    path: z.string().describe("Path to the folder to add as a knowledge base (absolute or relative to project root)"),
+  },
+  async execute(args) {
+    const inputPath = args.path.trim();
+
+    const normalizedPath = path.resolve(
+      path.isAbsolute(inputPath)
+        ? inputPath
+        : resolveKnowledgeBasePath(inputPath, sharedProjectRoot)
+    );
+
+    if (!existsSync(normalizedPath)) {
+      return `Error: Directory does not exist: ${normalizedPath}`;
+    }
+
+    // Resolve symlinks to get the real path for security checks only
+    let realPath: string;
+    try {
+      realPath = realpathSync(normalizedPath);
+    } catch {
+      return `Error: Cannot resolve path: ${normalizedPath}`;
+    }
+
+    // Security: block sensitive system directories (check against real path to prevent symlink bypass)
+    const blockedPrefixes = [
+      "/etc",
+      "/proc",
+      "/sys",
+      "/dev",
+      "/boot",
+      "/root",
+      "/var/run",
+      "/var/log",
+    ];
+    const homeDir = os.homedir();
+    const sensitiveDotDirs = [".ssh", ".gnupg", ".aws", ".config/gcloud", ".docker", ".kube"];
+
+    for (const prefix of blockedPrefixes) {
+      if (realPath === prefix || realPath.startsWith(prefix + "/")) {
+        return `Error: Adding system directory as knowledge base is not allowed: ${normalizedPath}`;
+      }
+    }
+
+    for (const dotDir of sensitiveDotDirs) {
+      const sensitiveDir = path.join(homeDir, dotDir);
+      if (realPath === sensitiveDir || realPath.startsWith(sensitiveDir + "/")) {
+        return `Error: Adding sensitive directory as knowledge base is not allowed: ${normalizedPath}`;
+      }
+    }
+
+    try {
+      const stat = statSync(normalizedPath);
+      if (!stat.isDirectory()) {
+        return `Error: Path is not a directory: ${normalizedPath}`;
+      }
+    } catch (error) {
+      return `Error: Cannot access directory: ${normalizedPath} - ${error instanceof Error ? error.message : String(error)}`;
+    }
+
+    const config = loadEditableConfig(sharedProjectRoot);
+    const knowledgeBases: string[] = ensureStringArray(config.knowledgeBases);
+
+    const alreadyExists = hasMatchingKnowledgeBasePath(knowledgeBases, normalizedPath, sharedProjectRoot);
+
+    if (alreadyExists) {
+      return `Knowledge base already configured: ${normalizedPath}`;
+    }
+
+    knowledgeBases.push(normalizedPath);
+    config.knowledgeBases = knowledgeBases;
+    saveConfig(sharedProjectRoot, config);
+    refreshIndexerFromConfig();
+
+    let result = `${normalizedPath}\n`;
+    result += `Total knowledge bases: ${knowledgeBases.length}\n`;
+    result += `Config saved to: ${getConfigPath(sharedProjectRoot)}\n`;
+    result += `\nRun /index to rebuild the index with the new knowledge base.`;
+
+    return result;
+  },
+});
+
+export const list_knowledge_bases: ToolDefinition = tool({
+  description:
+    "List all configured knowledge base folders that are indexed alongside the main project.",
+  args: {},
+  async execute() {
+    const config = loadRuntimeConfig(sharedProjectRoot);
+    const knowledgeBases: string[] = ensureStringArray(config.knowledgeBases);
+
+    if (knowledgeBases.length === 0) {
+      return "No knowledge bases configured. Use add_knowledge_base to add folders.";
+    }
+
+    let result = `Knowledge Bases (${knowledgeBases.length}):\n\n`;
+
+    for (let i = 0; i < knowledgeBases.length; i++) {
+      const kb = knowledgeBases[i];
+      const resolvedPath = resolveKnowledgeBasePath(kb, sharedProjectRoot);
+      const exists = existsSync(resolvedPath);
+
+      result += `[${i + 1}] ${kb}\n`;
+      result += `    Resolved: ${resolvedPath}\n`;
+      result += `    Status: ${exists ? "Exists" : "NOT FOUND"}\n`;
+      if (exists) {
+        try {
+          const stat = statSync(resolvedPath);
+          result += `    Type: ${stat.isDirectory() ? "Directory" : "File"}\n`;
+        } catch { /* ignore */ }
+      }
+      result += "\n";
+    }
+
+    result += `Config file: ${getConfigPath(sharedProjectRoot)}`;
+    return result;
+  },
+});
+
+export const remove_knowledge_base: ToolDefinition = tool({
+  description:
+    "Remove a knowledge base folder from the semantic search index.",
+  args: {
+    path: z.string().describe("Path of the knowledge base to remove (must match the configured path exactly)"),
+  },
+  async execute(args) {
+    const inputPath = args.path.trim();
+
+    const config = loadEditableConfig(sharedProjectRoot);
+    const knowledgeBases: string[] = ensureStringArray(config.knowledgeBases);
+
+    if (knowledgeBases.length === 0) {
+      return "No knowledge bases configured.";
+    }
+
+    const index = findKnowledgeBasePathIndex(knowledgeBases, inputPath, sharedProjectRoot);
+
+    if (index === -1) {
+      let result = `Knowledge base not found: ${inputPath}\n\n`;
+      result += `Currently configured:\n`;
+      for (const kb of knowledgeBases) {
+        result += `  - ${kb}\n`;
+      }
+      return result;
+    }
+
+    const removed = knowledgeBases.splice(index, 1)[0];
+    config.knowledgeBases = knowledgeBases;
+    saveConfig(sharedProjectRoot, config);
+    refreshIndexerFromConfig();
+
+    let result = `Removed: ${removed}\n\n`;
+    result += `Remaining knowledge bases: ${knowledgeBases.length}\n`;
+    result += `Config saved to: ${getConfigPath(sharedProjectRoot)}\n`;
+    result += `\nRun /index to rebuild the index without the removed knowledge base.`;
+
+    return result;
   },
 });
