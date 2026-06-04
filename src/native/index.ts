@@ -7,22 +7,6 @@ function getNativeBinding() {
   const platform = os.platform();
   const arch = os.arch();
 
-  let bindingName: string;
-  
-  if (platform === "darwin" && arch === "arm64") {
-    bindingName = "codebase-index-native.darwin-arm64.node";
-  } else if (platform === "darwin" && arch === "x64") {
-    bindingName = "codebase-index-native.darwin-x64.node";
-  } else if (platform === "linux" && arch === "x64") {
-    bindingName = "codebase-index-native.linux-x64-gnu.node";
-  } else if (platform === "linux" && arch === "arm64") {
-    bindingName = "codebase-index-native.linux-arm64-gnu.node";
-  } else if (platform === "win32" && arch === "x64") {
-    bindingName = "codebase-index-native.win32-x64-msvc.node";
-  } else {
-    throw new Error(`Unsupported platform: ${platform}-${arch}`);
-  }
-
   // Determine the current directory - handle ESM, CJS, and bundled contexts
   let currentDir: string;
   let requireTarget: string;
@@ -51,11 +35,36 @@ function getNativeBinding() {
   const packageRoot = isDevMode
     ? path.resolve(currentDir, '../..')
     : path.resolve(currentDir, '..');
-  const nativePath = path.join(packageRoot, 'native', bindingName);
+  const nativeDir = path.join(packageRoot, 'native');
   
   // Load the native module - use standard require for .node files
   const require = module.createRequire(requireTarget);
-  return require(nativePath);
+
+  if (platform === "darwin" && arch === "arm64") {
+    return require(path.join(nativeDir, "codebase-index-native.darwin-arm64.node"));
+  }
+  if (platform === "darwin" && arch === "x64") {
+    return require(path.join(nativeDir, "codebase-index-native.darwin-x64.node"));
+  }
+  if (platform === "win32" && arch === "x64") {
+    return require(path.join(nativeDir, "codebase-index-native.win32-x64-msvc.node"));
+  }
+  if (platform === "linux" && (arch === "x64" || arch === "arm64")) {
+    // Try both musl and gnu variants — avoids fragile libc detection in sandboxed environments
+    const errors: Error[] = [];
+    for (const libc of ["musl", "gnu"]) {
+      try {
+        return require(path.join(nativeDir, `codebase-index-native.linux-${arch}-${libc}.node`));
+      } catch (e) {
+        errors.push(e as Error);
+      }
+    }
+    throw new Error(
+      `Failed to load Linux native binding. Tried:\n${errors.map((e) => `  - ${e.message}`).join("\n")}`
+    );
+  }
+
+  throw new Error(`Unsupported platform: ${platform}-${arch}`);
 }
 
 function createMockNativeBinding() {
